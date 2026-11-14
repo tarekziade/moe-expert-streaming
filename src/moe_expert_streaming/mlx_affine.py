@@ -107,6 +107,7 @@ def gather_qmm(x, w, scales, biases, lhs_indices=None, rhs_indices=None, transpo
         inputs = inputs.index_select(0, lhs_indices.reshape(-1))
         rows = inputs.shape[0]
     rhs = rhs_indices.reshape(-1)
+    w = w.view(torch.int32)  # CUDA cannot index uint32 tensors; same bits
     if rows <= 64:
         weights = dequantize(w[rhs], scales[rhs], biases[rhs], group_size, bits, dtype=inputs.dtype)  # [S, N, K]
         return torch.bmm(inputs.unsqueeze(1), weights.transpose(1, 2))

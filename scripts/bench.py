@@ -152,6 +152,8 @@ def main():
     )
     parser.add_argument("--no-mps-commit", action="store_true", help="A/B: no early MPS command-buffer commits")
     parser.add_argument("--device", default=None, help="mps or cuda (default: the available one)")
+    parser.add_argument("--host-cache-gib", type=float, default=0.0, help="Tier of experts in pinned host memory")
+    parser.add_argument("--host-preload", action="store_true", help="Read every expert into the host tier at load")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     global DEVICE
@@ -170,6 +172,8 @@ def main():
         bypass_page_cache=args.bypass_page_cache,
         mps_commit=not args.no_mps_commit,
         device=DEVICE,
+        host_cache_gib=args.host_cache_gib,
+        host_preload=args.host_preload,
     )
     load_s = time.perf_counter() - start
     after_load = device_memory()
@@ -181,6 +185,8 @@ def main():
         "page_cache": "bypassed" if args.bypass_page_cache else "on",
         "dense": "8-bit MetalConfig" if (args.dense_bits or (args.dense_bits is None and DEVICE == "mps")) else "bf16",
         "device": DEVICE,
+        "host_cache_gib": args.host_cache_gib,
+        "host_preload": args.host_preload,
         "prefill_chunk_size": args.prefill_chunk_size,
         "torch": torch.__version__,
         "platform": platform.platform(),

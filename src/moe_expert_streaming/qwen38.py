@@ -162,9 +162,13 @@ def load_qwen38(
     cache_policy="lru",
     bypass_page_cache=False,
     mps_commit=True,
+    host_cache_gib=0.0,
+    host_preload=False,
 ):
     """Load a checkpoint written by ``scripts/convert_fp8.py``: ``dense/``, ``experts-q{bits}/`` and ``ngram/``.
 
+    ``host_cache_gib`` / ``host_preload``: a tier of experts in pinned host memory between storage and the device
+    cache, as Strata keeps its experts in RAM (needs a transformers with the host tier; for discrete GPUs).
     ``dense_bits``: ``"auto"`` = 8-bit ``MetalConfig`` on MPS, BF16 elsewhere; an int quantizes with ``MetalConfig``
     (MPS only); ``None`` keeps BF16.
     """
@@ -195,6 +199,11 @@ def load_qwen38(
                 "cache_policy": cache_policy,
                 "bypass_page_cache": bypass_page_cache,
                 "mps_commit": mps_commit,
+                **(
+                    {"host_cache_bytes": int(host_cache_gib * 2**30), "host_preload": host_preload}
+                    if host_cache_gib
+                    else {}
+                ),
             },
         )
     if dense_bits and on_mps:

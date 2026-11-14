@@ -92,12 +92,22 @@ def quantize(weight, group_size, bits):
     return pack(codes, bits), scales, biases
 
 
+@functools.cache
+def _triton_available():
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def gather_qmm(x, w, scales, biases, lhs_indices=None, rhs_indices=None, transpose=True, group_size=64, bits=4, **_):
     """``mx.gather_qmm(x, w, ..., transpose=True)`` for CUDA/CPU: row ``i`` of ``x [S, 1, K]`` times expert
     ``rhs_indices[i]`` of the quantized bank ``w [E, N, K*bits/32]`` -> ``[S, 1, N]``.
 
-    Dequantizes the experts it needs to ``x``'s dtype, then runs dense matmuls: one batched matmul over gathered
-    experts for small calls (decode, no host synchronization), one matmul per distinct expert for large ones (prefill).
+    Small calls (decode) on CUDA: the fused Triton kernel (:mod:`.kernels.triton_gather_qmv`), which reads only the
+    packed experts. Otherwise the experts are dequantized to ``x``'s dtype and run as dense matmuls: one batched
+    matmul over the gathered experts for small calls, one matmul per distinct expert for large ones (prefill).
     """
     if not transpose:
         raise NotImplementedError("gather_qmm: only transpose=True (nn.Linear layout) is supported")
@@ -108,6 +118,10 @@ def gather_qmm(x, w, scales, biases, lhs_indices=None, rhs_indices=None, transpo
         rows = inputs.shape[0]
     rhs = rhs_indices.reshape(-1)
     w = w.view(torch.int32)  # CUDA cannot index uint32 tensors; same bits
+    if rows <= 64 and inputs.is_cuda and _triton_available():
+        from .kernels.triton_gather_qmv import gather_qmv
+
+        return gather_qmv(inputs, w, scales, biases, rhs, group_size, bits).unsqueeze(1)
     if rows <= 64:
         weights = dequantize(w[rhs], scales[rhs], biases[rhs], group_size, bits, dtype=inputs.dtype)  # [S, N, K]
         return torch.bmm(inputs.unsqueeze(1), weights.transpose(1, 2))

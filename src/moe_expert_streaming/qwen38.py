@@ -30,23 +30,35 @@ class DiskEmbedding(torch.nn.Module):
 
     _DTYPES = {"float8_e4m3fn": torch.float8_e4m3fn, "bfloat16": torch.bfloat16, "float32": torch.float32}
 
-    def __init__(self, directory, dtype=torch.bfloat16):
+    def __init__(self, directory, dtype=torch.bfloat16, read_threads=16):
         super().__init__()
-        import numpy as np
+        import os
+        from concurrent.futures import ThreadPoolExecutor
 
         info = json.loads((Path(directory) / "ngram.json").read_text(encoding="utf-8"))
         self.rows, self.dim = info["rows"], info["dim"]
         self.stored_dtype = self._DTYPES[info["dtype"]]
         self.scale = float(info.get("scale", 1.0))
-        row_bytes = self.dim * self.stored_dtype.itemsize
-        self.table = np.memmap(Path(directory) / info["file"], dtype=np.uint8, mode="r", shape=(self.rows, row_bytes))
+        self.row_bytes = self.dim * self.stored_dtype.itemsize
+        # One descriptor, rows read in parallel: a token's rows are random, and reading them one page fault at a time
+        # costs one storage latency each (16 rows: 1.4 ms on a local SSD, 0.25 ms in parallel; far more on network
+        # storage).
+        self.fd = os.open(Path(directory) / info["file"], os.O_RDONLY)
+        self.pool = ThreadPoolExecutor(read_threads, thread_name_prefix="disk-embedding") if read_threads else None
         self.dtype = dtype
         # Callers read `.weight.device` to place their indices; it follows the model to its device.
         self.register_buffer("weight", torch.empty(0, device="cpu", dtype=dtype), persistent=False)
 
+    def _read_row(self, row):
+        import os
+
+        return os.pread(self.fd, self.row_bytes, row * self.row_bytes)
+
     def forward(self, ids):
-        flat = ids.reshape(-1).cpu().numpy()
-        rows = torch.from_numpy(self.table[flat]).view(self.stored_dtype).float()
+        flat = ids.reshape(-1).tolist()
+        reads = self.pool.map(self._read_row, flat) if self.pool is not None else map(self._read_row, flat)
+        raw = bytearray(b"".join(reads))
+        rows = torch.frombuffer(raw, dtype=torch.uint8).view(self.stored_dtype).view(len(flat), self.dim).float()
         if self.scale != 1.0:
             rows = rows * self.scale
         return rows.to(self.dtype).view(*ids.shape, self.dim).to(self.weight.device, non_blocking=True)

@@ -19,9 +19,10 @@ N = int(sys.argv[4]) if len(sys.argv) > 4 else 512
 BITS = int(sys.argv[5]) if len(sys.argv) > 5 else 8
 CACHE = float(sys.argv[6]) if len(sys.argv) > 6 else 12
 tok = AutoTokenizer.from_pretrained(root / "dense")
-model = load_qwen38(root, cache_gib=CACHE, dense_bits=BITS if BITS < 16 else None)
+device = "cuda" if torch.cuda.is_available() else "mps"
+model = load_qwen38(root, cache_gib=CACHE, dense_bits=BITS if BITS < 16 else None, device=device)
 text = open(text_file).read()
-ids = tok(text, return_tensors="pt").input_ids[:, :N].to("mps")
+ids = tok(text, return_tensors="pt").input_ids[:, :N].to(device)
 nll, top1 = [], []
 t0 = time.perf_counter()
 with torch.inference_mode():

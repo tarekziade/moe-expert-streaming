@@ -5,7 +5,9 @@ applied by :func:`apply`:
 
 - the 51 GB hashed n-gram table read from disk row by row (:class:`DiskEmbedding`), instead of materialized;
 - decode on Apple GPUs: the Gated DeltaNet step and the hyper-connection step as Metal kernels;
-- the QSA indexer skips token selection while every token fits its budget (2,048 keys), where it selects them all.
+- the QSA indexer skips token selection while every token fits its budget (2,048 keys), where it selects them all;
+- off Apple GPUs (CUDA), quantized experts run through :func:`mlx_affine.gather_qmm` (dequantize, then dense matmuls)
+  instead of the slow per-expert PyTorch reference.
 """
 
 import contextlib
@@ -14,7 +16,7 @@ from pathlib import Path
 
 import torch
 
-from . import metal_linear
+from . import metal_linear, mlx_affine
 from .kernels import gated_delta_net, hyper_connection
 
 
@@ -77,9 +79,22 @@ def _patch(cls, name, make):
 
 def apply():
     """Install the Qwen3.8 patches and the Metal dense-layer patches (idempotent)."""
+    from transformers.integrations import experts_offload
     from transformers.models.qwen4_exp import modeling_qwen4_exp as m
 
     metal_linear.apply()
+
+    def load_gather_qmm(original):
+        # TODO(portability): replace the dequantize-then-matmul path with a fused CUDA (Triton) gather_qmm.
+        def load(device):
+            return original(device) if torch.device(device).type == "mps" else mlx_affine.gather_qmm
+
+        return load
+
+    if not getattr(experts_offload._load_gather_qmm, "_moe_expert_streaming", False):
+        patched = load_gather_qmm(experts_offload._load_gather_qmm)
+        patched._moe_expert_streaming = True
+        experts_offload._load_gather_qmm = patched
 
     def ngram_init(original):
         def __init__(self, *args, **kwargs):
@@ -141,17 +156,26 @@ def load_qwen38(
     *,
     cache_gib=12.0,
     bits=3,
-    dense_bits=8,
+    dense_bits="auto",
     io_threads=8,
     device="mps",
     cache_policy="lru",
     bypass_page_cache=False,
     mps_commit=True,
 ):
-    """Load a checkpoint written by ``scripts/convert_fp8.py``: ``dense/``, ``experts-q{bits}/`` and ``ngram/``."""
+    """Load a checkpoint written by ``scripts/convert_fp8.py``: ``dense/``, ``experts-q{bits}/`` and ``ngram/``.
+
+    ``dense_bits``: ``"auto"`` = 8-bit ``MetalConfig`` on MPS, BF16 elsewhere; an int quantizes with ``MetalConfig``
+    (MPS only); ``None`` keeps BF16.
+    """
     from transformers import MetalConfig, Qwen4ExpForCausalLM
 
     apply()
+    on_mps = torch.device(device).type == "mps"
+    if dense_bits == "auto":
+        dense_bits = 8 if on_mps else None
+    if dense_bits and not on_mps:
+        raise ValueError("dense_bits needs MPS (MetalConfig); use dense_bits=None (BF16) on other devices")
     converted = Path(converted)
     with disk_ngram_table(converted / "ngram"):
         model = Qwen4ExpForCausalLM.from_pretrained(
@@ -173,6 +197,6 @@ def load_qwen38(
                 "mps_commit": mps_commit,
             },
         )
-    if dense_bits and torch.device(device).type == "mps":
+    if dense_bits and on_mps:
         metal_linear.kernelize_layers(model)
     return model.eval()

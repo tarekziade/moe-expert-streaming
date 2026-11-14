@@ -23,9 +23,10 @@ from pathlib import Path
 
 import torch
 from huggingface_hub import hf_hub_download
-from kernels import get_kernel
 from safetensors import safe_open
 from safetensors.torch import save_file
+
+from moe_expert_streaming import mlx_affine
 
 
 REPO = "Qwen/Qwen3.8-Flash-Next-FP8"
@@ -48,13 +49,14 @@ def main():
     parser.add_argument("--bits", type=int, default=3)
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--revision", default="main")
+    parser.add_argument("--device", default=None, help="cuda, mps or cpu (default: the first available)")
     args = parser.parse_args()
-    out, device = args.out, torch.device("mps")
+    default = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    out, device = args.out, torch.device(args.device or default)
     staging, dense_dir = out / "staging", out / "dense"
     experts_dir, ngram_dir = out / f"experts-q{args.bits}", out / "ngram"
     for directory in (staging, dense_dir, experts_dir, ngram_dir):
         directory.mkdir(parents=True, exist_ok=True)
-    kernel = get_kernel("kernels-community/mlx-quantization-metal-kernels", version=2)
     # FP8 E4M3 -> float32 for all 256 bit patterns, so dequantization is a gather on the GPU.
     fp8_values = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float().to(device)
 
@@ -117,9 +119,7 @@ def main():
         parts = pending_experts[layer].pop(expert)
         blob = []
         for weight in (torch.cat((parts["gate"], parts["up"])), parts["down"]):
-            packed, scales, biases = kernel.quantize(
-                weight.to(torch.bfloat16), group_size=args.group_size, bits=args.bits
-            )
+            packed, scales, biases = mlx_affine.quantize(weight.to(torch.bfloat16), args.group_size, args.bits)
             blob += [packed, scales, biases]
         expert_rows[layer][expert] = torch.cat([t.cpu().contiguous().view(torch.uint8).reshape(-1) for t in blob])
         if len(expert_rows[layer]) == num_experts:
@@ -201,7 +201,7 @@ def main():
         "format": "mlx-affine-expert-blob",
         "bits": args.bits,
         "group_size": args.group_size,
-        "quantizer": "mlx-quantization-metal-kernels",
+        "quantizer": "mlx-affine (moe_expert_streaming.mlx_affine, bit-exact with mx.quantize)",
         "source": f"{REPO}@{args.revision}",
     }
     (experts_dir / "quantization.json").write_text(json.dumps(info, indent=2))

@@ -36,6 +36,18 @@ DECODE_PROMPTS = [
 ]
 
 
+DEVICE = "cuda" if torch.cuda.is_available() else "mps"
+
+
+def device_memory():
+    """Device memory in use: the MPS driver's allocation, or what PyTorch reserved on CUDA."""
+    return torch.mps.driver_allocated_memory() if DEVICE == "mps" else torch.cuda.memory_reserved()
+
+
+def synchronize():
+    torch.mps.synchronize() if DEVICE == "mps" else torch.cuda.synchronize()
+
+
 class DevicePeak:
     """Peak MPS driver memory, sampled every 20 ms (the allocator's own peak is not exposed on MPS)."""
 
@@ -46,7 +58,7 @@ class DevicePeak:
 
     def run(self):
         while self.running:
-            self.peak = max(self.peak, torch.mps.driver_allocated_memory())
+            self.peak = max(self.peak, device_memory())
             time.sleep(0.02)
 
     def stop(self):
@@ -79,7 +91,7 @@ def generate(model, tokenizer, prompt, new_tokens, prefill_chunk_size=None):
         inputs = tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, return_tensors="pt", return_dict=True
         )
-    ids = inputs["input_ids"].to("mps")
+    ids = inputs["input_ids"].to(DEVICE)
     first = {"calls": 0}
 
     class FirstToken:
@@ -94,7 +106,7 @@ def generate(model, tokenizer, prompt, new_tokens, prefill_chunk_size=None):
             pass
 
     stats_before = model.experts_offload_store.stats()
-    torch.mps.synchronize()
+    synchronize()
     start = time.perf_counter()
     with torch.no_grad():
         out = model.generate(
@@ -105,7 +117,7 @@ def generate(model, tokenizer, prompt, new_tokens, prefill_chunk_size=None):
             streamer=FirstToken(),
             prefill_chunk_size=prefill_chunk_size,
         )
-    torch.mps.synchronize()
+    synchronize()
     end = time.perf_counter()
     stats = model.experts_offload_store.stats()
     generated = out.shape[1] - ids.shape[1]
@@ -139,8 +151,11 @@ def main():
         "--dense-bits", type=int, default=None, help="Quantize the dense nn.Linear weights (MetalConfig)"
     )
     parser.add_argument("--no-mps-commit", action="store_true", help="A/B: no early MPS command-buffer commits")
+    parser.add_argument("--device", default=None, help="mps or cuda (default: the available one)")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    global DEVICE
+    DEVICE = args.device or DEVICE
     dense = args.converted / "dense"
     tokenizer = AutoTokenizer.from_pretrained(dense)
     peak = DevicePeak()
@@ -149,21 +164,23 @@ def main():
         args.converted,
         cache_gib=args.cache_gib,
         bits=args.bits,
-        dense_bits=args.dense_bits,
+        dense_bits=args.dense_bits if args.dense_bits is not None else "auto",
         io_threads=args.io_threads,
         cache_policy=args.cache_policy,
         bypass_page_cache=args.bypass_page_cache,
         mps_commit=not args.no_mps_commit,
+        device=DEVICE,
     )
     load_s = time.perf_counter() - start
-    after_load = torch.mps.driver_allocated_memory()
+    after_load = device_memory()
     report = {
         "model": "Qwen3.8-Flash-Next (from Qwen/Qwen3.8-Flash-Next-FP8)",
         "experts": f"{args.bits}-bit MLX affine, group 64",
         "cache_gib": args.cache_gib,
         "io_threads": args.io_threads,
         "page_cache": "bypassed" if args.bypass_page_cache else "on",
-        "dense": f"{args.dense_bits}-bit MetalConfig" if args.dense_bits else "bf16",
+        "dense": "8-bit MetalConfig" if (args.dense_bits or (args.dense_bits is None and DEVICE == "mps")) else "bf16",
+        "device": DEVICE,
         "prefill_chunk_size": args.prefill_chunk_size,
         "torch": torch.__version__,
         "platform": platform.platform(),

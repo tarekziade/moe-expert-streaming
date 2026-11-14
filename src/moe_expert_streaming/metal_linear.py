@@ -51,37 +51,11 @@ def _metal_linear_forward(self, input):
     return output
 
 
-def _round_half_away(t):
-    return t.sign() * (t.abs() + 0.5).floor()
-
-
 def affine_quantize(weight, group_size, bits):
-    """``mx.quantize``: on MPS through the kernel, elsewhere an exact torch reference (same codes, same scales).
+    """``mx.quantize`` (Metal kernel on MPS, a bit-exact torch version elsewhere)."""
+    from . import mlx_affine
 
-    Returns ``(w_packed uint32 [N, K * bits / 32], scales, biases)``, scales and biases in ``weight``'s dtype.
-    """
-    if weight.device.type == "mps":
-        return load_metal_kernel().quantize(weight.contiguous(), group_size=group_size, bits=bits)
-    n, k = weight.shape
-    per_int, max_val, groups = 32 // bits, (1 << bits) - 1, k // group_size
-    grouped = weight.float().reshape(n, groups, group_size)
-    w_min = grouped.amin(dim=-1)
-    w_max = grouped.amax(dim=-1).clamp(min=0)  # MLX starts its running max at 0
-    scales = ((w_max - w_min) / max_val).clamp(min=1e-7)
-    # Snap the larger-magnitude edge onto the grid so it is represented exactly, as MLX does.
-    side = w_min.abs() > w_max.abs()
-    scales = torch.where(side, scales, -scales)
-    edge = torch.where(side, w_min, w_max)
-    q0 = _round_half_away(edge / scales)
-    at_zero = q0 == 0
-    scales = torch.where(at_zero, scales, edge / q0)
-    biases = torch.where(at_zero, torch.zeros_like(edge), edge)
-    codes = _round_half_away((grouped - biases.unsqueeze(-1)) / scales.unsqueeze(-1)).clamp(0, max_val)
-    codes = codes.to(torch.int32).reshape(n, k)
-    packed = torch.zeros(n, k // per_int, dtype=torch.int32, device=weight.device)
-    for i in range(per_int):
-        packed |= codes[:, i::per_int] << (bits * i)
-    return packed.to(torch.uint32), scales.to(weight.dtype), biases.to(weight.dtype)
+    return mlx_affine.quantize(weight, group_size, bits)
 
 
 def _quantize_tensor(weight, group_size, bits):

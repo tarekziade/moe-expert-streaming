@@ -154,6 +154,9 @@ def main():
     parser.add_argument("--device", default=None, help="mps or cuda (default: the available one)")
     parser.add_argument("--host-cache-gib", type=float, default=0.0, help="Tier of experts in pinned host memory")
     parser.add_argument("--host-preload", action="store_true", help="Read every expert into the host tier at load")
+    parser.add_argument(
+        "--long-doc", action="store_true", help="Decode 200 tokens after a ~6K-token document (Strata's third row)"
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     global DEVICE
@@ -192,7 +195,7 @@ def main():
         "platform": platform.platform(),
         "load_s": load_s,
         "device_after_load_bytes": after_load,
-        "runs": {"story": [], "prefill_4k": []},
+        "runs": {"story": [], "prefill_4k": [], "long_doc_6k": []},
     }
     for _ in range(0 if args.skip_story else args.runs):
         for prompt in DECODE_PROMPTS:
@@ -206,6 +209,11 @@ def main():
         for _ in range(args.runs):
             report["runs"]["prefill_4k"].append(generate(model, tokenizer, prompt, 32, args.prefill_chunk_size))
             print(json.dumps({k: v for k, v in report["runs"]["prefill_4k"][-1].items() if k != "text"}), flush=True)
+    if args.long_doc:
+        prompt = long_prompt(tokenizer, target=6000)
+        for _ in range(args.runs):
+            report["runs"]["long_doc_6k"].append(generate(model, tokenizer, prompt, 200, args.prefill_chunk_size))
+            print(json.dumps({k: v for k, v in report["runs"]["long_doc_6k"][-1].items() if k != "text"}), flush=True)
     report["device_peak_sampled_bytes"] = peak.stop()
     report["process_peak_rss_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     args.output.write_text(json.dumps(report, indent=2))

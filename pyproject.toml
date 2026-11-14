@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moe-expert-streaming"
+version = "0.1.0"
+description = "Run MoE models larger than memory with transformers by streaming experts from the SSD (Qwen3.8-Flash-Next on a 32 GB Mac)."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    # experts_offload: https://github.com/huggingface/transformers/pull/50717
+    "transformers @ git+https://github.com/huggingface/transformers@experts-offload",
+    "torch>=2.15",
+    "kernels>=0.18",
+    "safetensors",
+    "numpy",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moe_expert_streaming"]
+
+[tool.ruff]
+line-length = 119
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-first-party = ["moe_expert_streaming"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["E731", "E741"]

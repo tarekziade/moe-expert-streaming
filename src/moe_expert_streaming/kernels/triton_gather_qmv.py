@@ -24,7 +24,12 @@ def _gather_qmv_kernel(
     N,
     K,
     KW,
-    G,
+    w_se,  # strides (elements) of the expert and row dimensions; the last dimension is contiguous
+    w_sn,
+    s_se,
+    s_sn,
+    b_se,
+    b_sn,
     BITS: tl.constexpr,
     GROUP: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -34,9 +39,10 @@ def _gather_qmv_kernel(
     n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = n < N
     expert = tl.load(rhs_ptr + row).to(tl.int64)
-    w_rows = w_ptr + expert * N * KW + n[:, None].to(tl.int64) * KW
-    s_rows = s_ptr + expert * N * G + n[:, None].to(tl.int64) * G
-    b_rows = b_ptr + expert * N * G + n[:, None].to(tl.int64) * G
+    rows64 = n[:, None].to(tl.int64)
+    w_rows = w_ptr + expert * w_se + rows64 * w_sn
+    s_rows = s_ptr + expert * s_se + rows64 * s_sn
+    b_rows = b_ptr + expert * b_se + rows64 * b_sn
     code_mask = (1 << BITS) - 1
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
     for k0 in range(0, K, BLOCK_K):
@@ -66,14 +72,18 @@ def gather_qmv(x, w, scales, biases, rhs, group_size, bits, block_n=32, block_k=
     ``rhs [S]`` -> ``[S, N]`` in ``x``'s dtype."""
     rows, k = x.shape
     _, n, kw = w.shape
+    # The banks are usually strided views into the expert cache's slot buffer: never copy them.
+    w = w.view(torch.int32)
+    for bank in (w, scales, biases):
+        if bank.stride(-1) != 1:
+            raise ValueError("gather_qmv: the last dimension of the banks must be contiguous")
     x = x.contiguous()
-    w = w.contiguous().view(torch.int32)
-    scales, biases = scales.contiguous(), biases.contiguous()
     rhs = rhs.reshape(-1).contiguous()
     out = torch.empty(rows, n, dtype=torch.float32, device=x.device)
     grid = (rows, triton.cdiv(n, block_n))
     _gather_qmv_kernel[grid](
-        x, w, scales, biases, rhs, out, n, k, kw, scales.shape[-1],
+        x, w, scales, biases, rhs, out, n, k, kw,
+        w.stride(0), w.stride(1), scales.stride(0), scales.stride(1), biases.stride(0), biases.stride(1),
         BITS=bits, GROUP=group_size, BLOCK_N=block_n, BLOCK_K=block_k,
     )  # fmt: skip
     return out.to(x.dtype)

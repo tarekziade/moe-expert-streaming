@@ -30,6 +30,21 @@ def main():
             x = torch.randn(10, k, device=device, dtype=torch.bfloat16)
             rhs = torch.randint(0, 16, (10,), device=device)
             got = gather_qmv(x, w, s, b, rhs, 64, bits).float()
+            # Strided banks, as the expert cache hands them over: views into one byte buffer per slot.
+            blob = torch.cat([t.reshape(16, -1).view(torch.uint8) for t in (w.view(torch.int32), s, b)], dim=1)
+            sizes = [t[0].numel() * t.element_size() for t in (w, s, b)]
+            views, start = [], 0
+            for t, size in zip((w, s, b), sizes):
+                views.append(
+                    blob[:, start : start + size]
+                    .view(t.dtype if t.dtype != torch.uint32 else torch.int32)
+                    .view(t.shape)
+                )
+                start += size
+            strided = gather_qmv(x, *views, rhs, 64, bits).float()
+            if not torch.equal(strided, got):
+                print(f"bits {bits} [{n}x{k}] strided banks differ from contiguous ones: MISMATCH")
+                failures += 1
             dense = mlx_affine.dequantize(w.view(torch.int32)[rhs], s[rhs], b[rhs], 64, bits, dtype=torch.float32)
             want = torch.bmm(x.float().unsqueeze(1), dense.transpose(1, 2)).squeeze(1)
             rel = ((got - want).norm() / want.norm()).item()

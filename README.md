@@ -8,7 +8,7 @@ Results, architecture and analysis: <https://huggingface.co/spaces/tarekziade/mo
 
 | Qwen3.8-Flash-Next, M5 32 GB | |
 |---|---|
-| Decode | ~10 tok/s (median of 4 different 200-token answers, cold cache first) |
+| Decode | ~10 tok/s (median of 4 different 200-token answers, cold cache first; 9.99 with this package) |
 | Prefill, 4K-token prompt | 67–70 tok/s (1K chunks) |
 | Device memory after load | ~18 GiB with a 12 GiB expert cache |
 | Experts | 3-bit (49 GB on disk); dense layers 8-bit (perplexity +0.2% vs BF16) |

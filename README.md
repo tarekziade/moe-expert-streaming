@@ -9,7 +9,8 @@ Results, architecture and analysis: <https://huggingface.co/spaces/tarekziade/mo
 | Qwen3.8-Flash-Next, M5 32 GB | |
 |---|---|
 | Decode | ~11.7 tok/s with GGUF dense layers (median of 4 different 200-token answers, cold cache first); ~10 with 8-bit dense and read-ahead (before 2026-11-16) |
-| Prefill, 4K-token prompt | ~105 tok/s (2K chunks, GGUF dense, next-layer read-ahead from #50717 at `18abece3ab`); 67–70 with 1K chunks before 2026-11-16 |
+| Prefill, 4K-token prompt | ~159 tok/s (2K chunks, GGUF dense, next-layer read-ahead from #50717 at `18abece3ab`, vectorized indexer); 67–70 before 2026-11-16 |
+| After a 6K-token document | prefill ~150 tok/s, decode ~8.5 tok/s (12 GiB cache) |
 | Device memory after load | ~18 GiB with a 12 GiB expert cache |
 | Experts | 3-bit (49 GB on disk); dense layers 8-bit (perplexity +0.2% vs BF16) or GGUF (see below) |
 
@@ -21,7 +22,7 @@ The generic part lives in Transformers itself; this project adds what is not (ye
 |---|---|
 | `from_pretrained(..., experts_offload={...})`: expert cache, SSD reads, prefetch, quantized experts, early MPS commits | [huggingface/transformers#50717](https://github.com/huggingface/transformers/pull/50717) |
 | `MetalConfig` dense layers on the v2 MLX kernels (`quantized_matmul`), MLX-exact quantization, ggml layer kernels | [huggingface/transformers#49467](https://github.com/huggingface/transformers/pull/49467), carried in `metal_linear.py` until merged |
-| Qwen3.8: the 51 GB n-gram table read from disk, Metal decode kernels (Gated DeltaNet, hyper-connections), QSA indexer shortcut | this package (`qwen38.py`, `kernels/`) |
+| Qwen3.8: the 51 GB n-gram table read from disk, Metal decode kernels (Gated DeltaNet, hyper-connections), QSA indexer shortcut and vectorized selection | this package (`qwen38.py`, `kernels/`) |
 | Dense layers from a GGUF file on ggml's kernels (`ggml-org/ggml-quantization`) | this package (`gguf_dense.py`) |
 | Converter, benchmark, profiling and analysis scripts | this package (`scripts/`, `repro/`) |
 
@@ -106,7 +107,9 @@ Add `--gguf-dense /path/to/...-00001-of-00002.gguf` to either command for GGUF d
 Prefill chunk size: a prompt chunk routes to nearly every expert of every layer, so each chunk reads them all again
 (4K prompt: 145 GB with 1K chunks, 86 GB with 2K). On the M5 32 GB, 2K chunks are fastest (74–77 -> 89–96 tok/s); 3K is
 slower and a single 4K chunk swaps. On top of that, `experts_offload` reads the next layer's experts during prefill
-(`prefill_readahead_routes`, #50717): 103–106 tok/s. The Gated DeltaNet prefill runs on `ggml-org/ggml-gated-delta-net`
+(`prefill_readahead_routes`, #50717): 103–106 tok/s. Past 2,048 keys the QSA indexer's token selection (a Python loop with a
+host sync per query in the model) runs vectorized for causal masks (`indexer.py`, same masks): 108–110 -> 158–160 tok/s;
+`MOE_STREAMING_FAST_INDEXER=0` to compare. The Gated DeltaNet prefill runs on `ggml-org/ggml-gated-delta-net`
 (+2.6%; `MOE_STREAMING_GGML_GDN_PREFILL=0` to compare).
 
 | Script | What it measures |

@@ -23,19 +23,19 @@ def supports(ggml_type, device):
     return torch.device(device).type == "mps" and ggml_type in NAMES
 
 
-def tiles_for(counts, slots, starts=None):
+def tiles_for(counts, slots, starts=None, tile_rows=TILE_ROWS):
     """Tiles ``(slot, first row, rows)`` int32 for rows sorted by expert: ``counts[i]`` rows from ``starts[i]`` (default:
     packed in order) use bank slot ``slots[i]``. One host synchronization (the tile count)."""
     counts = counts.to(torch.int64)
     if starts is None:
         starts = torch.cumsum(counts, 0) - counts
-    per_expert = (counts + TILE_ROWS - 1) // TILE_ROWS
+    per_expert = (counts + tile_rows - 1) // tile_rows
     total = int(per_expert.sum())
     expert = torch.repeat_interleave(torch.arange(counts.numel(), device=counts.device), per_expert, output_size=total)
     first_tile = torch.cumsum(per_expert, 0) - per_expert
     within = torch.arange(total, device=counts.device) - first_tile[expert]
-    start = starts.to(torch.int64)[expert] + within * TILE_ROWS
-    rows = torch.clamp(counts[expert] - within * TILE_ROWS, max=TILE_ROWS)
+    start = starts.to(torch.int64)[expert] + within * tile_rows
+    rows = torch.clamp(counts[expert] - within * tile_rows, max=tile_rows)
     return torch.stack([slots.to(counts.device)[expert], start, rows], dim=1).to(torch.int32).contiguous()
 
 
@@ -59,3 +59,40 @@ def mm_tiles(bank, ggml_type, x, tiles, out=None, kernel="mpp"):
             threads=count * 128, group_size=128,
         )
     return out
+
+
+_SUFFIX = {torch.bfloat16: "bfloat", torch.float16: "half", torch.float32: "float"}
+
+
+def mm_rows(bank, ggml_type, x, rows, tiles, tile_rows, out=None):
+    """``out[r] = x[rows[r]] @ bank[slot of r's tile].T`` (float32) for routes ``r`` sorted by expert: reads ``x``
+    (bf16 / f16 / f32) in place through ``rows``; ``tiles`` from :func:`tiles_for` with ``tile_rows`` (32 or 64)."""
+    slots, n, row_bytes = bank.shape
+    if n % 64 or x.shape[1] % 64:
+        raise ValueError(f"gguf_mm needs N % 64 == 0 and K % 64 == 0, got {n}, {x.shape[1]}")
+    if out is None:
+        out = torch.empty(rows.shape[0], n, dtype=torch.float32, device=x.device)
+    count = tiles.shape[0] * (n // 64)
+    if count:
+        getattr(_library(), f"gguf_mm_mpp2_{NAMES[ggml_type]}_{_SUFFIX[x.dtype]}_{tile_rows}")(
+            bank, x.contiguous(), rows, tiles, out, _params(n, x.shape[1], row_bytes, x.device),
+            threads=count * 128, group_size=128,
+        )
+    return out
+
+
+@functools.cache
+def _combine_params(tokens, hidden, top_k, device):
+    return torch.tensor([tokens, hidden, top_k], dtype=torch.int32, device=device)
+
+
+def combine(routed, pos, weights, dtype):
+    """``y[t] = sum_j weights[t, j] * routed[pos[t, j]]`` (j in order), ``(tokens, hidden)`` of ``dtype``."""
+    tokens, top_k = weights.shape
+    hidden = routed.shape[1]
+    y = torch.empty(tokens, hidden, dtype=dtype, device=routed.device)
+    getattr(_library(), f"gguf_combine_{_SUFFIX[dtype]}")(
+        routed, pos.to(torch.int32).contiguous(), weights.float().contiguous(), y,
+        _combine_params(tokens, hidden, top_k, routed.device), threads=tokens * hidden // 4,
+    )
+    return y

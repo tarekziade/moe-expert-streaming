@@ -357,6 +357,49 @@ def _tiled_forward(module, store, size_class, hidden_states, top_k_index, top_k_
     return result.to(hidden_states.dtype)
 
 
+PREFILL_TILE_ROWS = int(os.environ.get("GGUF_EXPERTS_TILE_ROWS", "32"))
+
+
+def _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts):
+    """Prefill on MPS: routes sorted by expert; the tile GEMMs read the hidden states in place through a row index, and
+    a combine kernel sums each token's routes (no gathered copy, no scatter)."""
+    from .kernels import gguf_mm
+
+    prefix, (tokens, top_k) = module.offload_prefix, top_k_index.shape
+    device, tile_rows = hidden_states.device, PREFILL_TILE_ROWS
+    flat = top_k_index.reshape(-1)
+    order = torch.argsort(flat, stable=True)
+    source = (order // top_k).to(torch.int32)
+    position = torch.empty_like(order)
+    position[order] = torch.arange(order.numel(), device=device)
+    counts = torch.bincount(flat, minlength=store.num_experts)
+    starts = torch.cumsum(counts, 0) - counts
+    table = store.slot_tables[prefix]
+    resident = table < size_class.num_slots
+    store.inflight.append(table.clone())  # read by the copy below until the next sync
+    slots = table.to(device, non_blocking=True).to(torch.int64)
+    calls = [(size_class.gate_up, size_class.down, gguf_mm.tiles_for(counts * resident.to(device), slots, starts, tile_rows))]
+    extra = [expert for expert in experts if not resident[expert]]
+    if extra:
+        blocks = [store.expert_blocks(prefix, expert) for expert in extra]
+        index = torch.zeros(store.num_experts, dtype=torch.int64)
+        index[extra] = torch.arange(len(extra))
+        mask = torch.zeros(store.num_experts, dtype=counts.dtype)
+        mask[extra] = 1
+        tiles = gguf_mm.tiles_for(counts * mask.to(device), index.to(device), starts, tile_rows)
+        calls.append((torch.stack([b[0] for b in blocks]), torch.stack([b[1] for b in blocks]), tiles))
+    gate_up = torch.empty(order.numel(), 2 * store.intermediate, dtype=torch.float32, device=device)
+    for bank, _, tiles in calls:
+        gguf_mm.mm_rows(bank, size_class.gate_type, hidden_states, source, tiles, tile_rows, out=gate_up)
+    activated = module._apply_gate(gate_up)  # float32: +0.4 ms per 2K-token layer, rel err 1.7e-3 instead of 2.3e-3
+    del gate_up
+    identity = torch.arange(order.numel(), device=device, dtype=torch.int32)
+    down = torch.empty(order.numel(), store.hidden, dtype=torch.float32, device=device)
+    for _, bank, tiles in calls:
+        gguf_mm.mm_rows(bank, size_class.down_type, activated, identity, tiles, tile_rows, out=down)
+    return gguf_mm.combine(down, position.view(tokens, top_k), top_k_weights, hidden_states.dtype)
+
+
 def gguf_experts_forward(module, hidden_states, top_k_index, top_k_weights):
     """The experts forward for a model whose store is a :class:`GgufExpertStore`."""
     from transformers.integrations.experts_offload import _commit_mps
@@ -379,7 +422,7 @@ def gguf_experts_forward(module, hidden_states, top_k_index, top_k_weights):
         if top_k_index.numel() <= GEMV_MAX_ROUTES and len(pinned) == len(experts):
             result = _gemv_forward(module, store, size_class, hidden_states, routing, top_k_weights)
         elif hidden_states.device.type == "mps":
-            result = _tiled_forward(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts)
+            result = _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts)
         else:
             result = _grouped_forward(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts)
     finally:

@@ -973,3 +973,98 @@ INSTANTIATE_MPP(iq3_xxs, block_iq3_xxs, QK_NL)
 INSTANTIATE_MPP(iq3_s, block_iq3_s, QK_NL)
 INSTANTIATE_MPP(iq4_nl, block_iq4_nl, 2)
 
+// ---- v2: TM-row tiles (32 or 64), the activations read in place through a row index (no gathered copy; bf16, half
+// or float), float output. rows[r] = the input row of sorted route r.
+template <typename T, int TM, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void gguf_mm_mpp2(
+        device const char * W [[buffer(0)]],
+        device const T * X [[buffer(1)]],
+        device const int * rows [[buffer(2)]],
+        device const int * tiles [[buffer(3)]],
+        device float * dst [[buffer(4)]],
+        device const uint * params [[buffer(5)]],
+        uint group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr int TN = 64, TK = 64, NTH = 128;
+    threadgroup half xa[TM * TK];
+    threadgroup half wd[TN * TK];
+    threadgroup int src_row[TM];
+    const uint N = params[0], K = params[1], row_bytes = params[2], column_blocks = params[3];
+    const uint tile = group / column_blocks;
+    const int n0 = (group % column_blocks) * TN;
+    const int slot = tiles[3 * tile + 0];
+    const int r1 = tiles[3 * tile + 1];
+    const int nr1 = tiles[3 * tile + 2];
+    device const char * w0 = W + ulong(slot) * N * row_bytes + ulong(n0) * row_bytes;
+    for (int m = tid; m < TM; m += NTH) src_row[m] = rows[r1 + min(m, nr1 - 1)];
+
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(TM, TN, TK, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tA(xa, dextents<int32_t, 2>(TK, TM));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tW(wd, dextents<int32_t, 2>(TK, TN));
+    auto acc = op.template get_destination_cooperative_tensor<decltype(tA), decltype(tW), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i)) acc[i] = 0.0f;
+
+    for (uint k0 = 0; k0 < K; k0 += TK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int it = tid; it < TM * TK / 4; it += NTH) {
+            const int m = (4 * it) / TK, k = (4 * it) % TK;
+            const vec<T, 4> v = *(device const vec<T, 4> *)(X + ulong(src_row[m]) * K + k0 + k);
+            *(threadgroup half4 *)(xa + m * TK + k) = m < nr1 ? half4(float4(v)) : half4(0.0h);
+        }
+        for (int it = tid; it < TN * (TK / 16); it += NTH) {
+            const int r = it / (TK / 16), c = it % (TK / 16);
+            const uint k = k0 + 16 * c;
+            device const block_q * b = (device const block_q *)(w0 + ulong(r) * row_bytes) + k / (16 * nl);
+            half4x4 v;
+            dequantize_func(b, short((k / 16) % nl), v);
+            threadgroup half * d = wd + r * TK + 16 * c;
+            for (int i = 0; i < 4; ++i) *(threadgroup half4 *)(d + 4 * i) = v[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        op.run(tA, tW, acc);
+    }
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tY(dst, dextents<int32_t, 2>(N, r1 + nr1));
+    acc.store(tY.slice(n0, r1));
+}
+
+// y[t, d] = sum_j weights[t, j] * routed[pos[t * top_k + j], d], in j order; one thread per (t, 4 columns).
+template <typename T>
+kernel void gguf_combine(
+        device const float * routed [[buffer(0)]],
+        device const int * pos [[buffer(1)]],
+        device const float * weights [[buffer(2)]],
+        device T * y [[buffer(3)]],
+        device const uint * params [[buffer(4)]],  // tokens, hidden, top_k
+        uint gid [[thread_position_in_grid]]) {
+    const uint hidden4 = params[1] / 4, top_k = params[2];
+    const uint t = gid / hidden4, d = 4 * (gid % hidden4);
+    if (t >= params[0]) return;
+    float4 s = 0.0f;
+    for (uint j = 0; j < top_k; ++j) {
+        const int r = pos[t * top_k + j];
+        s = fma(float4(weights[t * top_k + j]), *(device const float4 *)(routed + ulong(r) * params[1] + d), s);
+    }
+    *(device vec<T, 4> *)(y + ulong(t) * params[1] + d) = vec<T, 4>(s);
+}
+
+#define INSTANTIATE_MPP2(NAME, BLOCK, NL, T, TNAME, TM) \
+  template [[host_name("gguf_mm_mpp2_" #NAME "_" TNAME "_" #TM)]] kernel void gguf_mm_mpp2<T, TM, BLOCK, NL, dequantize_##NAME<half4x4>>( \
+      device const char *, device const T *, device const int *, device const int *, device float *, device const uint *, uint, ushort);
+#define INSTANTIATE_MPP2_ALL(NAME, BLOCK, NL) \
+  INSTANTIATE_MPP2(NAME, BLOCK, NL, bfloat, "bfloat", 32) INSTANTIATE_MPP2(NAME, BLOCK, NL, bfloat, "bfloat", 64) \
+  INSTANTIATE_MPP2(NAME, BLOCK, NL, float, "float", 32) INSTANTIATE_MPP2(NAME, BLOCK, NL, float, "float", 64) \
+  INSTANTIATE_MPP2(NAME, BLOCK, NL, half, "half", 32) INSTANTIATE_MPP2(NAME, BLOCK, NL, half, "half", 64)
+INSTANTIATE_MPP2_ALL(q2_0, block_q2_0, 4)
+INSTANTIATE_MPP2_ALL(iq2_xxs, block_iq2_xxs, QK_NL)
+INSTANTIATE_MPP2_ALL(iq2_xs, block_iq2_xs, QK_NL)
+INSTANTIATE_MPP2_ALL(iq2_s, block_iq2_s, QK_NL)
+INSTANTIATE_MPP2_ALL(iq3_xxs, block_iq3_xxs, QK_NL)
+INSTANTIATE_MPP2_ALL(iq3_s, block_iq3_s, QK_NL)
+INSTANTIATE_MPP2_ALL(iq4_nl, block_iq4_nl, 2)
+template [[host_name("gguf_combine_bfloat")]] kernel void gguf_combine<bfloat>(device const float *, device const int *, device const float *, device bfloat *, device const uint *, uint);
+template [[host_name("gguf_combine_half")]] kernel void gguf_combine<half>(device const float *, device const int *, device const float *, device half *, device const uint *, uint);
+template [[host_name("gguf_combine_float")]] kernel void gguf_combine<float>(device const float *, device const int *, device const float *, device float *, device const uint *, uint);
+

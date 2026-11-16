@@ -254,6 +254,6 @@ def load_qwen38(
         if not gguf_dense:
             raise ValueError("gguf_experts needs gguf_dense (the GGUF the .experts file was made from)")
         gguf_experts_module.attach(
-            model, paths[0], int(cache_gib * 2**30), io_threads=io_threads, bypass_page_cache=True
+            model, paths[0], int(cache_gib * 2**30), io_threads=io_threads, bypass_page_cache=bypass_page_cache
         )
     return model.eval()

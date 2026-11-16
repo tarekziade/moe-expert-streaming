@@ -24,6 +24,17 @@ def _causal(visible, past):
     return positions[None, :] <= (past + torch.arange(rows, device=visible.device))[:, None]
 
 
+def _block_keys(indexer, raw_keys, full_cos, full_sin, first, last, apply_rotary_pos_emb):
+    """Pooled, normalized, rotated keys of complete blocks ``first..last-1`` (as the original computes them)."""
+    ratio, head_dim = indexer.compress_ratio, indexer.index_head_dim
+    key_groups = raw_keys[0, first * ratio : last * ratio].view(last - first, ratio, head_dim)
+    pooled = indexer.k_layernorm(key_groups.float().mean(dim=1).to(raw_keys.dtype))
+    starts = torch.arange(first, last, device=raw_keys.device) * ratio
+    return apply_rotary_pos_emb(
+        pooled.unsqueeze(1), cos=full_cos[0].index_select(0, starts), sin=full_sin[0].index_select(0, starts)
+    ).squeeze(1)
+
+
 def select(indexer, hidden_states, position_embeddings, attention_mask, past_key_values, apply_rotary_pos_emb):
     """``indexer.forward`` for a batch of one with a plain causal mask, else ``None`` (before any side effect)."""
     batch_size, seq_length, _ = hidden_states.shape
@@ -33,7 +44,18 @@ def select(indexer, hidden_states, position_embeddings, attention_mask, past_key
     kv_length = visible.shape[-1]
     past = kv_length - seq_length
     expected = _causal(visible, past)
-    if visible.shape[1] != 1 or not torch.equal(visible[0, 0], expected):
+    # Decode steps continuing a sequence whose previous mask was checked: one more key, no new padding, so still plain
+    # causal; skip the check (a host synchronization) and reuse the pooled keys of the complete blocks.
+    state = getattr(indexer, "_fast_state", None)
+    continuing = (
+        past_key_values is not None
+        and seq_length == 1
+        and state is not None
+        and state[0] is past_key_values
+        and state[1] == kv_length - 1
+    )
+    if visible.shape[1] != 1 or (not continuing and not torch.equal(visible[0, 0], expected)):
+        indexer._fast_state = None
         return None
 
     # Same projections, norms, rotary embedding and cache update as the original.
@@ -55,13 +77,16 @@ def select(indexer, hidden_states, position_embeddings, attention_mask, past_key
     # Complete blocks visible to each query: (past + i + 1) // ratio.
     blocks_per_query = (past + torch.arange(seq_length, device=device) + 1) // ratio
     selected = torch.zeros(seq_length, kv_length + 1, dtype=torch.bool, device=device)
+    cached = state[2] if continuing else None
+    block_keys = None
     if num_blocks > 0:
-        key_groups = raw_keys[0, : num_blocks * ratio].view(num_blocks, ratio, head_dim)
-        pooled = indexer.k_layernorm(key_groups.float().mean(dim=1).to(raw_keys.dtype))
-        starts = torch.arange(num_blocks, device=device) * ratio
-        block_keys = apply_rotary_pos_emb(
-            pooled.unsqueeze(1), cos=full_cos[0].index_select(0, starts), sin=full_sin[0].index_select(0, starts)
-        ).squeeze(1)
+        if cached is not None and cached.shape[0] == num_blocks:
+            block_keys = cached
+        elif cached is not None and cached.shape[0] == num_blocks - 1:
+            new = _block_keys(indexer, raw_keys, full_cos, full_sin, num_blocks - 1, num_blocks, apply_rotary_pos_emb)
+            block_keys = torch.cat([cached, new])
+        else:
+            block_keys = _block_keys(indexer, raw_keys, full_cos, full_sin, 0, num_blocks, apply_rotary_pos_emb)
         # scores[i, j] = sum over heads of relu(q_i,h . k_j) / sqrt(head_dim), as the original per query.
         scores = torch.einsum("thd,nd->thn", q[0].float(), block_keys.float()).relu().sum(dim=1) / math.sqrt(head_dim)
         valid = torch.arange(num_blocks, device=device)[None, :] < blocks_per_query[:, None]
@@ -71,5 +96,8 @@ def select(indexer, hidden_states, position_embeddings, attention_mask, past_key
         tokens = top[..., None] * ratio + torch.arange(ratio, device=device)
         tokens = torch.where(top_valid[..., None], tokens, kv_length).reshape(seq_length, -1)
         selected.scatter_(1, tokens, True)
+    indexer._fast_state = (
+        (past_key_values, kv_length, block_keys) if past_key_values is not None and block_keys is not None else None
+    )
     tail = torch.arange(kv_length, device=device)[None, :] >= (blocks_per_query * ratio)[:, None]
     return (selected[:, :kv_length] | (tail & expected)).view(1, 1, seq_length, kv_length)

@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 
 from . import metal_linear, mlx_affine
-from .kernels import gated_delta_net, hyper_connection
+from .kernels import gated_delta_net, gdn_prefill, hyper_connection
 
 
 class DiskEmbedding(torch.nn.Module):
@@ -132,6 +132,8 @@ def apply():
         return forward
 
     _patch(m.Qwen4ExpTextGatedDeltaNet, "forward", gdn_forward)
+    # Prefill (and chunked prompts): the chunked delta rule on ggml's kernel instead of the PyTorch reference.
+    _patch(m, "torch_chunk_gated_delta_rule", lambda original: gdn_prefill.wrap(original, m.l2norm))
 
     def residual_forward(original):
         # TODO(portability): Metal-only decode step (MPS); other backends keep the original forward.

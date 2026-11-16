@@ -44,17 +44,17 @@ def _params(n, k, row_bytes, device):
     return torch.tensor([n, k, row_bytes, n // 64], dtype=torch.int32, device=device)
 
 
-def mm_tiles(bank, ggml_type, x, tiles, out=None):
+def mm_tiles(bank, ggml_type, x, tiles, out=None, kernel="mpp"):
     """``out[rows of tile t] = x[rows] @ bank[slot of t].T`` (float32): ``bank`` ``(slots, N, row_bytes)`` uint8,
     ``x`` ``(R, K)`` float32 sorted by expert, ``tiles`` from :func:`tiles_for`."""
     slots, n, row_bytes = bank.shape
-    if n % 64 or x.shape[1] % 32:
-        raise ValueError(f"gguf_mm needs N % 64 == 0 and K % 32 == 0, got {n}, {x.shape[1]}")
+    if n % 64 or x.shape[1] % 64:
+        raise ValueError(f"gguf_mm needs N % 64 == 0 and K % 64 == 0, got {n}, {x.shape[1]}")
     if out is None:
         out = torch.empty(x.shape[0], n, dtype=torch.float32, device=x.device)
     count = tiles.shape[0] * (n // 64)
     if count:
-        getattr(_library(), f"gguf_mm_tiles_{NAMES[ggml_type]}")(
+        getattr(_library(), f"gguf_mm_{kernel}_{NAMES[ggml_type]}")(
             bank, x.float().contiguous(), tiles, out, _params(n, x.shape[1], row_bytes, x.device),
             threads=count * 128, group_size=128,
         )

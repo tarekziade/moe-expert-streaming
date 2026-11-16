@@ -2,7 +2,7 @@
 replays the output of its first decode call instead of computing (zero device and host cost). The decode time saved
 by ablating a category is what making it free would buy, measured under normal pipelining.
 
-Usage: dense_ablation.py CONVERTED_DIR
+Usage: dense_ablation.py CONVERTED_DIR [GGUF_SHARD]  (GGUF: dense layers from it, see gguf_dense)
 """
 
 import json
@@ -24,7 +24,7 @@ experts_offload.experts_offload_forward = lambda module, hidden_states, top_k_in
 )
 root = Path(sys.argv[1])
 tok = AutoTokenizer.from_pretrained(root / "dense")
-model = load_qwen38(root, cache_gib=1, io_threads=0)
+model = load_qwen38(root, cache_gib=1, io_threads=0, gguf_dense=sys.argv[2] if len(sys.argv) > 2 else None)
 model.eval()
 layers = model.model.layers
 CATS = {

@@ -1,6 +1,6 @@
 """Teacher-forced perplexity through the decode path (one token per forward), so decode-only kernels are exercised.
 
-Usage: decode_ppl.py CONVERTED_DIR TEXT_FILE TAG [TOKENS=512] [DENSE_BITS=8, 16 for BF16] [CACHE_GIB=12]
+Usage: decode_ppl.py CONVERTED_DIR TEXT_FILE TAG [TOKENS=512] [DENSE_BITS=8, 16 for BF16] [CACHE_GIB=12] [GGUF...]
 Prints the perplexity and saves each step's top-1 token to top1_TAG.pt (compare runs for agreement).
 """
 
@@ -20,7 +20,8 @@ BITS = int(sys.argv[5]) if len(sys.argv) > 5 else 8
 CACHE = float(sys.argv[6]) if len(sys.argv) > 6 else 12
 tok = AutoTokenizer.from_pretrained(root / "dense")
 device = "cuda" if torch.cuda.is_available() else "mps"
-model = load_qwen38(root, cache_gib=CACHE, dense_bits=BITS if BITS < 16 else None, device=device)
+GGUF = sys.argv[7:] or None
+model = load_qwen38(root, cache_gib=CACHE, dense_bits=BITS if BITS < 16 else None, device=device, gguf_dense=GGUF)
 text = open(text_file).read()
 ids = tok(text, return_tensors="pt").input_ids[:, :N].to(device)
 nll, top1 = [], []

@@ -180,9 +180,18 @@ def _is_metal_linear(linear):
     return linear.weight.dtype == torch.uint32 and hasattr(linear, "scales")
 
 
+def _is_gguf_linear(linear):
+    return hasattr(linear, "blocks") and hasattr(linear, "ggml_type")
+
+
 def _merge_projections(module):
     """Concatenate in_proj_qkv / z / b / a along the output dimension, once; the layers keep views into the result."""
     linears = [module.in_proj_qkv, module.in_proj_z, module.in_proj_b, module.in_proj_a]
+    module._metal_gate_params = (module.A_log.detach().float(), module.dt_bias.detach().float())
+    if any(_is_gguf_linear(linear) for linear in linears):
+        # GGUF projections have their own (per-tensor) types: one call each.
+        module._metal_in_proj = (None, linears)
+        return
     names = ("weight", "scales", "qbiases") if _is_metal_linear(linears[0]) else ("weight",)
     merged = {name: torch.cat([getattr(linear, name).data for linear in linears]) for name in names}
     start = 0
@@ -195,7 +204,6 @@ def _merge_projections(module):
     if len(names) == 3:
         quantized = (linears[0].group_size, linears[0].bits)
     module._metal_in_proj = (merged, quantized)
-    module._metal_gate_params = (module.A_log.detach().float(), module.dt_bias.detach().float())
 
 
 # TODO(portability): Metal-only decode step (MPS); other backends use the PyTorch / hub-kernel path.
@@ -211,12 +219,14 @@ def supports(module, hidden_states, cache_params, attention_mask):
     if conv_state is None or state is None or state.dtype != torch.float32 or not state.is_contiguous():
         return False
     linears = [module.in_proj_qkv, module.in_proj_z, module.in_proj_b, module.in_proj_a]
-    if len({_is_metal_linear(linear) for linear in linears}) != 1 or any(
-        linear.bias is not None for linear in linears
-    ):
+    if any(linear.bias is not None for linear in linears):
         return False
-    if _is_metal_linear(linears[0]) and len({(linear.group_size, linear.bits) for linear in linears}) != 1:
-        return False
+    # GGUF projections run one call each; otherwise the four are merged into one matmul and must match.
+    if not any(_is_gguf_linear(linear) for linear in linears):
+        if len({_is_metal_linear(linear) for linear in linears}) != 1:
+            return False
+        if _is_metal_linear(linears[0]) and len({(linear.group_size, linear.bits) for linear in linears}) != 1:
+            return False
     return (
         conv_state.is_contiguous()
         and conv_state.dtype == hidden_states.dtype
@@ -247,7 +257,9 @@ def gated_delta_net_step(module, hidden_states, cache_params):
     library, suffix = _library(), _SUFFIX[hidden_states.dtype]
     device = hidden_states.device
     x = hidden_states.reshape(1, -1)
-    if quantized is not None:
+    if merged is None:
+        projections = torch.cat([linear(x).reshape(-1) for linear in quantized])
+    elif quantized is not None:
         from ..metal_linear import load_metal_kernel
 
         group_size, bits = quantized

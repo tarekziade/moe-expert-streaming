@@ -176,11 +176,13 @@ def load_qwen38(
     mps_commit=True,
     host_cache_gib=0.0,
     host_preload=False,
+    gguf_dense=None,
 ):
     """Load a checkpoint written by ``scripts/convert_fp8.py``: ``dense/``, ``experts-q{bits}/`` and ``ngram/``.
 
     ``host_cache_gib`` / ``host_preload``: a tier of experts in pinned host memory between storage and the device
     cache, as Strata keeps its experts in RAM (needs a transformers with the host tier; for discrete GPUs).
+    ``gguf_dense``: GGUF file(s) whose quantized dense tensors replace the model's (see :mod:`gguf_dense`; MPS).
     ``dense_bits``: ``"auto"`` = 8-bit ``MetalConfig`` on MPS, BF16 elsewhere; an int quantizes with ``MetalConfig``
     (MPS only); ``None`` keeps BF16.
     """
@@ -220,4 +222,9 @@ def load_qwen38(
         )
     if dense_bits and on_mps:
         metal_linear.kernelize_layers(model)
+    if gguf_dense:
+        from . import gguf_dense as gguf_dense_module
+
+        paths = [gguf_dense] if isinstance(gguf_dense, (str, Path)) else list(gguf_dense)
+        gguf_dense_module.replace_dense(model, paths)
     return model.eval()

@@ -157,6 +157,7 @@ def main():
     parser.add_argument(
         "--long-doc", action="store_true", help="Decode 200 tokens after a ~6K-token document (Strata's third row)"
     )
+    parser.add_argument("--gguf-dense", type=Path, nargs="*", default=None, help="GGUF shard(s) for the dense layers")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     global DEVICE
@@ -177,6 +178,7 @@ def main():
         device=DEVICE,
         host_cache_gib=args.host_cache_gib,
         host_preload=args.host_preload,
+        gguf_dense=args.gguf_dense,
     )
     load_s = time.perf_counter() - start
     after_load = device_memory()
@@ -190,6 +192,7 @@ def main():
         "device": DEVICE,
         "host_cache_gib": args.host_cache_gib,
         "host_preload": args.host_preload,
+        "gguf_dense": [str(p) for p in args.gguf_dense or []],
         "prefill_chunk_size": args.prefill_chunk_size,
         "torch": torch.__version__,
         "platform": platform.platform(),

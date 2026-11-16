@@ -210,7 +210,7 @@ def replace_dense(model, gguf_paths, include_lm_head=True, verbose=True):
     if verbose:
         print(
             f"gguf_dense: replaced {len(replaced)} projections, kept {len(kept)} ({sorted(set(kept.values()))}), "
-            f"{saved / 1e9:.2f} GB less",
+            f"{saved / 1e9:.2f} GB fewer weight bytes",
             flush=True,
         )
     return summary

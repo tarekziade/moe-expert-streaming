@@ -77,7 +77,7 @@ model = load_qwen38("/path/to/qwen38", cache_gib=12, dense_bits=8, gguf_dense="/
 | Decode-path perplexity, 512 tokens (BF16 3.3558) | 3.3629 | 3.4088 (+1.4%) |
 | Top-1 agreement with BF16 | 94.5% | 94.5% |
 | Prefill-path perplexity, 1,024 tokens (BF16 4.9007) | 4.9009 | 4.9397 (+0.8%) |
-| Device memory | | 1.45 GB less |
+| Device memory (tensors) | 16.20 GiB | 14.90 GiB (but the MPS driver keeps what the replaced 8-bit weights freed: 17.5 vs 17.8 GiB after load) |
 
 ### Expert read-ahead (`prefetch_depth`)
 

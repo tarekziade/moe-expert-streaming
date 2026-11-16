@@ -9,7 +9,7 @@ Results, architecture and analysis: <https://huggingface.co/spaces/tarekziade/mo
 | Qwen3.8-Flash-Next, M5 32 GB | |
 |---|---|
 | Decode | ~11.7 tok/s with GGUF dense layers (median of 4 different 200-token answers, cold cache first); ~10 with 8-bit dense and read-ahead (before 2026-11-16) |
-| Prefill, 4K-token prompt | 67–70 tok/s (1K chunks) |
+| Prefill, 4K-token prompt | ~105 tok/s (2K chunks, GGUF dense, next-layer read-ahead from #50717 at `18abece3ab`); 67–70 with 1K chunks before 2026-11-16 |
 | Device memory after load | ~18 GiB with a 12 GiB expert cache |
 | Experts | 3-bit (49 GB on disk); dense layers 8-bit (perplexity +0.2% vs BF16) or GGUF (see below) |
 
@@ -98,10 +98,16 @@ critical memory pressure instead of freezing the Mac:
 ./scripts/run_guarded.sh decode.log scripts/bench.py /path/to/qwen38 --cache-gib 12 --dense-bits 8 \
     --io-threads 8 --skip-prefill --output decode.json
 ./scripts/run_guarded.sh prefill.log scripts/bench.py /path/to/qwen38 --cache-gib 10 --dense-bits 8 \
-    --io-threads 8 --skip-story --prefill-chunk-size 1024 --output prefill.json
+    --io-threads 8 --skip-story --prefill-chunk-size 2048 --output prefill.json
 ```
 
 Add `--gguf-dense /path/to/...-00001-of-00002.gguf` to either command for GGUF dense layers.
+
+Prefill chunk size: a prompt chunk routes to nearly every expert of every layer, so each chunk reads them all again
+(4K prompt: 145 GB with 1K chunks, 86 GB with 2K). On the M5 32 GB, 2K chunks are fastest (74–77 -> 89–96 tok/s); 3K is
+slower and a single 4K chunk swaps. On top of that, `experts_offload` reads the next layer's experts during prefill
+(`prefill_readahead_routes`, #50717): 103–106 tok/s. The Gated DeltaNet prefill runs on `ggml-org/ggml-gated-delta-net`
+(+2.6%; `MOE_STREAMING_GGML_GDN_PREFILL=0` to compare).
 
 | Script | What it measures |
 |---|---|

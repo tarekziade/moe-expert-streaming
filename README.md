@@ -8,10 +8,10 @@ Results, architecture and analysis: <https://huggingface.co/spaces/tarekziade/mo
 
 | Qwen3.8-Flash-Next, M5 32 GB | |
 |---|---|
-| Decode | ~10 tok/s (median of 4 different 200-token answers, cold cache first; 9.99 with this package) |
+| Decode | ~10 tok/s (median of 4 different 200-token answers, cold cache first); ~11.2 with GGUF dense layers |
 | Prefill, 4K-token prompt | 67–70 tok/s (1K chunks) |
 | Device memory after load | ~18 GiB with a 12 GiB expert cache |
-| Experts | 3-bit (49 GB on disk); dense layers 8-bit (perplexity +0.2% vs BF16) |
+| Experts | 3-bit (49 GB on disk); dense layers 8-bit (perplexity +0.2% vs BF16) or GGUF (see below) |
 
 ## How it fits with Transformers
 
@@ -22,6 +22,7 @@ The generic part lives in Transformers itself; this project adds what is not (ye
 | `from_pretrained(..., experts_offload={...})`: expert cache, SSD reads, prefetch, quantized experts, early MPS commits | [huggingface/transformers#50717](https://github.com/huggingface/transformers/pull/50717) |
 | `MetalConfig` dense layers on the v2 MLX kernels (`quantized_matmul`), MLX-exact quantization, ggml layer kernels | [huggingface/transformers#49467](https://github.com/huggingface/transformers/pull/49467), carried in `metal_linear.py` until merged |
 | Qwen3.8: the 51 GB n-gram table read from disk, Metal decode kernels (Gated DeltaNet, hyper-connections), QSA indexer shortcut | this package (`qwen38.py`, `kernels/`) |
+| Dense layers from a GGUF file on ggml's kernels (`ggml-org/ggml-quantization`) | this package (`gguf_dense.py`) |
 | Converter, benchmark, profiling and analysis scripts | this package (`scripts/`, `repro/`) |
 
 Patches are applied at the class level by `moe_expert_streaming.apply()`; nothing in Transformers is edited.
@@ -55,6 +56,29 @@ ids = tok.apply_chat_template([{"role": "user", "content": "Hello!"}], add_gener
 print(tok.decode(model.generate(ids, max_new_tokens=100)[0, ids.shape[1]:]))
 ```
 
+### Dense layers from a GGUF file (optional, faster decode)
+
+`gguf_dense=` replaces the large dense projections (Gated DeltaNet and attention projections, shared experts, `lm_head`)
+with the packed tensors of a GGUF quantization, run on `ggml-org/ggml-quantization` (fused dequantize-gemv for decode,
+dequantize + matmul for prefill). With the first shard of
+[`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+(`IQ3_XXS/...-00001-of-00002.gguf`, the quantization Strata ships; only ~2.3 GB of it is read), dense layers are
+Q4_K-Q6_K / IQ4_XS / IQ3_S instead of 8-bit. Tensors without a Metal gemv (Q2_0) or stored in BF16 keep the model's
+own weights.
+
+```python
+model = load_qwen38("/path/to/qwen38", cache_gib=12, dense_bits=8, gguf_dense="/path/to/...-00001-of-00002.gguf")
+```
+
+| M5 32 GB | 8-bit dense | GGUF dense |
+|---|---|---|
+| Decode (alternating runs) | 9.58 / 9.29 tok/s | 10.85 / 10.56 tok/s |
+| 4K prefill | 68.2 tok/s | 69.7 tok/s |
+| Decode-path perplexity, 512 tokens (BF16 3.3558) | 3.3629 | 3.4088 (+1.4%) |
+| Top-1 agreement with BF16 | 94.5% | 94.5% |
+| Prefill-path perplexity, 1,024 tokens (BF16 4.9007) | 4.9009 | 4.9397 (+0.8%) |
+| Device memory | | 1.45 GB less |
+
 Other MoEs (OLMoE, Qwen3-MoE, ...) need nothing from this package: use `experts_offload` from Transformers directly.
 
 ## Benchmark
@@ -69,10 +93,13 @@ critical memory pressure instead of freezing the Mac:
     --io-threads 8 --skip-story --prefill-chunk-size 1024 --output prefill.json
 ```
 
+Add `--gguf-dense /path/to/...-00001-of-00002.gguf` to either command for GGUF dense layers.
+
 | Script | What it measures |
 |---|---|
 | `scripts/bench.py` | decode on 4 different prompts (cold cache first), 4K-token prefill |
 | `scripts/decode_ppl.py` | teacher-forced perplexity through the decode path (one token per step) |
+| `scripts/prefill_ppl.py` | perplexity through the prefill path (one forward over 1,024 tokens) |
 | `scripts/dense_ablation.py` | dense-layer cost per module category (experts zeroed, replay ablation) |
 | `scripts/decode_profile.py` | host-side time split of the expert path (sync, read waits, bookkeeping) |
 | `scripts/cache_policy_trace.py`, `scripts/cache_policy_sim.py` | routing traces replayed through LRU / LFU / pinning / Belady |

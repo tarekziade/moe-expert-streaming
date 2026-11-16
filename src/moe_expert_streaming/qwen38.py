@@ -177,11 +177,14 @@ def load_qwen38(
     host_cache_gib=0.0,
     host_preload=False,
     gguf_dense=None,
+    prefetch_depth=0,
 ):
     """Load a checkpoint written by ``scripts/convert_fp8.py``: ``dense/``, ``experts-q{bits}/`` and ``ngram/``.
 
     ``host_cache_gib`` / ``host_preload``: a tier of experts in pinned host memory between storage and the device
     cache, as Strata keeps its experts in RAM (needs a transformers with the host tier; for discrete GPUs).
+    ``prefetch_depth``: layers ahead to guess and read experts (``experts_offload`` option). 0 by default: on the M5,
+    guessing costs more than it hides (decode 11.1 -> 11.7 tok/s without it).
     ``gguf_dense``: GGUF file(s) whose quantized dense tensors replace the model's (see :mod:`gguf_dense`; MPS).
     ``dense_bits``: ``"auto"`` = 8-bit ``MetalConfig`` on MPS, BF16 elsewhere; an int quantizes with ``MetalConfig``
     (MPS only); ``None`` keeps BF16.
@@ -213,6 +216,7 @@ def load_qwen38(
                 "cache_policy": cache_policy,
                 "bypass_page_cache": bypass_page_cache,
                 "mps_commit": mps_commit,
+                "prefetch_depth": prefetch_depth,
                 **(
                     {"host_cache_bytes": int(host_cache_gib * 2**30), "host_preload": host_preload}
                     if host_cache_gib

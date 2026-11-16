@@ -3,6 +3,7 @@
 Usage: prefill_ppl.py CONVERTED_DIR TEXT_FILE TAG [TOKENS=1024] [DENSE_BITS=8, 16 for BF16] [CACHE_GIB=10] [GGUF...]
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -20,7 +21,8 @@ CACHE = float(sys.argv[6]) if len(sys.argv) > 6 else 10
 GGUF = sys.argv[7:] or None
 tok = AutoTokenizer.from_pretrained(root / "dense")
 device = "cuda" if torch.cuda.is_available() else "mps"
-model = load_qwen38(root, cache_gib=CACHE, dense_bits=BITS if BITS < 16 else None, device=device, gguf_dense=GGUF)
+model = load_qwen38(root, cache_gib=CACHE, dense_bits=BITS if BITS < 16 else None, device=device, gguf_dense=GGUF,
+                   gguf_experts=os.environ.get("GGUF_EXPERTS") == "1")
 ids = tok(open(text_file).read(), return_tensors="pt").input_ids[:, :N].to(device)
 t0 = time.perf_counter()
 with torch.inference_mode():

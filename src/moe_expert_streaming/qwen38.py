@@ -191,6 +191,7 @@ def load_qwen38(
     host_preload=False,
     gguf_dense=None,
     prefetch_depth=0,
+    gguf_experts=False,
 ):
     """Load a checkpoint written by ``scripts/convert_fp8.py``: ``dense/``, ``experts-q{bits}/`` and ``ngram/``.
 
@@ -199,6 +200,9 @@ def load_qwen38(
     ``prefetch_depth``: layers ahead to guess and read experts (``experts_offload`` option). 0 by default: on the M5,
     guessing costs more than it hides (decode 11.1 -> 11.7 tok/s without it).
     ``gguf_dense``: GGUF file(s) whose quantized dense tensors replace the model's (see :mod:`gguf_dense`; MPS).
+    ``gguf_experts``: run the routed experts in the GGUF's quantization, from Strata's ``.experts`` file beside it (see
+    :mod:`gguf_experts`; needs ``gguf_dense``). ``cache_gib`` then sizes their cache; ``experts-q{bits}/`` is only read
+    for its layout.
     ``dense_bits``: ``"auto"`` = 8-bit ``MetalConfig`` on MPS, BF16 elsewhere; an int quantizes with ``MetalConfig``
     (MPS only); ``None`` keeps BF16.
     """
@@ -223,7 +227,7 @@ def load_qwen38(
                 else None
             ),
             experts_offload={
-                "cache_bytes": int(cache_gib * 2**30),
+                "cache_bytes": 0 if gguf_experts else int(cache_gib * 2**30),
                 "quantized_experts": converted / f"experts-q{bits}",
                 "io_threads": io_threads,
                 "cache_policy": cache_policy,
@@ -244,4 +248,12 @@ def load_qwen38(
 
         paths = [gguf_dense] if isinstance(gguf_dense, (str, Path)) else list(gguf_dense)
         gguf_dense_module.replace_dense(model, paths)
+    if gguf_experts:
+        from . import gguf_experts as gguf_experts_module
+
+        if not gguf_dense:
+            raise ValueError("gguf_experts needs gguf_dense (the GGUF the .experts file was made from)")
+        gguf_experts_module.attach(
+            model, paths[0], int(cache_gib * 2**30), io_threads=io_threads, bypass_page_cache=True
+        )
     return model.eval()

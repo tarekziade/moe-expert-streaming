@@ -16,7 +16,7 @@ from pathlib import Path
 
 import torch
 
-from . import metal_linear, mlx_affine
+from . import indexer, metal_linear, mlx_affine
 from .kernels import gated_delta_net, gdn_prefill, hyper_connection
 
 
@@ -149,6 +149,17 @@ def apply():
     def indexer_forward(original):
         def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values):
             if attention_mask.shape[-1] > self.token_budget:
+                if indexer.enabled():
+                    mask = indexer.select(
+                        self,
+                        hidden_states,
+                        position_embeddings,
+                        attention_mask,
+                        past_key_values,
+                        m.apply_rotary_pos_emb,
+                    )
+                    if mask is not None:
+                        return mask
                 return original(self, hidden_states, position_embeddings, attention_mask, past_key_values)
             # At most `token_budget` keys: every complete block fits in `block_topk` and the tail is always kept, so
             # every visible token is selected. Only the key cache update is needed; this skips the per-query selection

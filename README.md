@@ -8,7 +8,7 @@ Results, architecture and analysis: <https://huggingface.co/spaces/tarekziade/mo
 
 | Qwen3.8-Flash-Next, M5 32 GB | |
 |---|---|
-| Decode | ~10 tok/s (median of 4 different 200-token answers, cold cache first); ~11.2 with GGUF dense layers |
+| Decode | ~11.7 tok/s with GGUF dense layers (median of 4 different 200-token answers, cold cache first); ~10 with 8-bit dense and read-ahead (before 2026-11-16) |
 | Prefill, 4K-token prompt | 67–70 tok/s (1K chunks) |
 | Device memory after load | ~18 GiB with a 12 GiB expert cache |
 | Experts | 3-bit (49 GB on disk); dense layers 8-bit (perplexity +0.2% vs BF16) or GGUF (see below) |
@@ -79,6 +79,14 @@ model = load_qwen38("/path/to/qwen38", cache_gib=12, dense_bits=8, gguf_dense="/
 | Prefill-path perplexity, 1,024 tokens (BF16 4.9007) | 4.9009 | 4.9397 (+0.8%) |
 | Device memory | | 1.45 GB less |
 
+### Expert read-ahead (`prefetch_depth`)
+
+`experts_offload` can guess the next layers' experts from the current hidden state and read them ahead
+(`prefetch_depth`, layers ahead). On the M5 this costs more than it hides (guess routers, reads of unused guesses and
+their device copies), so `load_qwen38` defaults to `prefetch_depth=0`: decode 11.04 / 11.15 / 11.09 tok/s at depth 2
+vs 11.80 / 11.78 / 11.58 at depth 0 (alternating runs, GGUF dense). `scripts/predict_trace.py` and
+`scripts/predict_sim.py` evaluate predictors offline.
+
 Other MoEs (OLMoE, Qwen3-MoE, ...) need nothing from this package: use `experts_offload` from Transformers directly.
 
 ## Benchmark
@@ -100,6 +108,7 @@ Add `--gguf-dense /path/to/...-00001-of-00002.gguf` to either command for GGUF d
 | `scripts/bench.py` | decode on 4 different prompts (cold cache first), 4K-token prefill |
 | `scripts/decode_ppl.py` | teacher-forced perplexity through the decode path (one token per step) |
 | `scripts/prefill_ppl.py` | perplexity through the prefill path (one forward over 1,024 tokens) |
+| `scripts/predict_trace.py`, `scripts/predict_sim.py` | experts inputs + routing per MoE call; next-layer predictors replayed through an LRU cache |
 | `scripts/dense_ablation.py` | dense-layer cost per module category (experts zeroed, replay ablation) |
 | `scripts/decode_profile.py` | host-side time split of the expert path (sync, read waits, bookkeeping) |
 | `scripts/cache_policy_trace.py`, `scripts/cache_policy_sim.py` | routing traces replayed through LRU / LFU / pinning / Belady |

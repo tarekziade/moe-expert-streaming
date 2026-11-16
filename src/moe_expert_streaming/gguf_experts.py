@@ -358,6 +358,8 @@ def _tiled_forward(module, store, size_class, hidden_states, top_k_index, top_k_
 
 
 PREFILL_TILE_ROWS = int(os.environ.get("GGUF_EXPERTS_TILE_ROWS", "32"))
+# 16-row tiles for each expert's last <= 16 routes (0 disables).
+PREFILL_TAIL_ROWS = int(os.environ.get("GGUF_EXPERTS_TAIL_ROWS", "16"))
 
 
 def _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts):
@@ -378,7 +380,13 @@ def _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top
     resident = table < size_class.num_slots
     store.inflight.append(table.clone())  # read by the copy below until the next sync
     slots = table.to(device, non_blocking=True).to(torch.int64)
-    calls = [(size_class.gate_up, size_class.down, gguf_mm.tiles_for(counts * resident.to(device), slots, starts, tile_rows))]
+    def tile_lists(selected_counts, bank_slots):
+        if PREFILL_TAIL_ROWS:
+            tiles, tails = gguf_mm.split_tiles(selected_counts, bank_slots, starts, tile_rows, PREFILL_TAIL_ROWS)
+            return [(tiles, tile_rows), (tails, PREFILL_TAIL_ROWS)]
+        return [(gguf_mm.tiles_for(selected_counts, bank_slots, starts, tile_rows), tile_rows)]
+
+    calls = [(size_class.gate_up, size_class.down, tile_lists(counts * resident.to(device), slots))]
     extra = [expert for expert in experts if not resident[expert]]
     if extra:
         blocks = [store.expert_blocks(prefix, expert) for expert in extra]
@@ -386,17 +394,19 @@ def _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top
         index[extra] = torch.arange(len(extra))
         mask = torch.zeros(store.num_experts, dtype=counts.dtype)
         mask[extra] = 1
-        tiles = gguf_mm.tiles_for(counts * mask.to(device), index.to(device), starts, tile_rows)
-        calls.append((torch.stack([b[0] for b in blocks]), torch.stack([b[1] for b in blocks]), tiles))
+        lists = tile_lists(counts * mask.to(device), index.to(device))
+        calls.append((torch.stack([b[0] for b in blocks]), torch.stack([b[1] for b in blocks]), lists))
     gate_up = torch.empty(order.numel(), 2 * store.intermediate, dtype=torch.float32, device=device)
-    for bank, _, tiles in calls:
-        gguf_mm.mm_rows(bank, size_class.gate_type, hidden_states, source, tiles, tile_rows, out=gate_up)
+    for bank, _, lists in calls:
+        for tiles, rows in lists:
+            gguf_mm.mm_rows(bank, size_class.gate_type, hidden_states, source, tiles, rows, out=gate_up)
     activated = module._apply_gate(gate_up)  # float32: +0.4 ms per 2K-token layer, rel err 1.7e-3 instead of 2.3e-3
     del gate_up
     identity = torch.arange(order.numel(), device=device, dtype=torch.int32)
     down = torch.empty(order.numel(), store.hidden, dtype=torch.float32, device=device)
-    for _, bank, tiles in calls:
-        gguf_mm.mm_rows(bank, size_class.down_type, activated, identity, tiles, tile_rows, out=down)
+    for _, bank, lists in calls:
+        for tiles, rows in lists:
+            gguf_mm.mm_rows(bank, size_class.down_type, activated, identity, tiles, rows, out=down)
     return gguf_mm.combine(down, position.view(tokens, top_k), top_k_weights, hidden_states.dtype)
 
 

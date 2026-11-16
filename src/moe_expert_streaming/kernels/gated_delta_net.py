@@ -73,7 +73,8 @@ kernel void gdn_conv_gates(
 }
 
 // One threadgroup per value head, one thread per value column. dims: Hk, Hv, K, V, key_dim, gate_is_sigmoid,
-// offset of z in `projections`. q = qkv[0:key_dim], k = qkv[key_dim:2 key_dim], v = qkv[2 key_dim:]; z: (Hv, V).
+// offset of z in `projections`, tiled_out (write value head h at llama.cpp's tiled position
+// (h % ratio) * Hk + h / ratio). q = qkv[0:key_dim], k = qkv[key_dim:2 key_dim], v = qkv[2 key_dim:]; z: (Hv, V).
 template <typename T>
 kernel void gdn_delta_norm(
     device const T* qkv [[buffer(0)]],
@@ -94,6 +95,7 @@ kernel void gdn_delta_norm(
   const bool sigmoid_gate = dims[5] != 0;
   device const T* z = projections + dims[6];
   const uint k_head = head / (Hv / Hk);
+  const uint out_head = dims[7] != 0 ? (head % (Hv / Hk)) * Hk + k_head : head;
   device const T* q = qkv + k_head * K;
   device const T* k = qkv + key_dim + k_head * K;
   device const T* v = qkv + 2 * key_dim + head * V;
@@ -153,7 +155,7 @@ kernel void gdn_delta_norm(
   const T weighted = T(float(norm_weight[j]) * float(normed));
   const float zf = float(z[head * V + j]);
   const float gate = sigmoid_gate ? 1.0f / (1.0f + exp(-zf)) : zf / (1.0f + exp(-zf));
-  out[head * V + j] = T(float(weighted) * gate);
+  out[out_head * V + j] = T(float(weighted) * gate);
 }
 
 #define INSTANTIATE(T, NAME)                                                                                       \\
@@ -291,6 +293,8 @@ def gated_delta_net_step(module, hidden_states, cache_params):
     )
     out = torch.empty(value_dim, dtype=x.dtype, device=device)
     sigmoid_gate = int(module.norm.activation == "sigmoid")
+    # A GGUF out_proj expecting tiled heads: write them tiled here instead of gathering its input.
+    tiled_out = int(getattr(module.out_proj, "input_perm", None) is not None)
     getattr(library, f"gdn_delta_norm_{suffix}")(
         qkv,
         g,
@@ -300,11 +304,22 @@ def gated_delta_net_step(module, hidden_states, cache_params):
         module.norm.weight,
         out,
         _int_params(
-            (module.num_k_heads, heads, module.head_k_dim, module.head_v_dim, module.key_dim, sigmoid_gate, conv_dim),
+            (
+                module.num_k_heads,
+                heads,
+                module.head_k_dim,
+                module.head_v_dim,
+                module.key_dim,
+                sigmoid_gate,
+                conv_dim,
+                tiled_out,
+            ),
             device,
         ),
         _float_params((module.norm.variance_epsilon,), device),
         threads=heads * module.head_v_dim,
         group_size=module.head_v_dim,
     )
+    if tiled_out:
+        return module.out_proj(out.reshape(1, 1, value_dim), input_is_permuted=True)
     return module.out_proj(out.reshape(1, 1, value_dim))

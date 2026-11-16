@@ -70,10 +70,10 @@ class GgufLinear(torch.nn.Module):
     def extra_repr(self):
         return f"in_features={self.in_features}, out_features={self.out_features}, ggml_type={self.ggml_type}"
 
-    def forward(self, x):
+    def forward(self, x, input_is_permuted=False):
         kernel = load_kernel()
         flat = x.reshape(-1, self.in_features)
-        if self.input_perm is not None:
+        if self.input_perm is not None and not input_is_permuted:
             flat = flat.index_select(1, self.input_perm)
         if flat.shape[0] <= kernel.MAX_GEMV_ROWS:
             # f32 out; cast here

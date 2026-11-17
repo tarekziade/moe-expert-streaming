@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 
 from . import indexer, metal_linear, mlx_affine
-from .kernels import gated_delta_net, gated_norm, gdn_prefill, gdn_scan, hyper_connection
+from .kernels import gated_delta_net, gated_norm, gdn_prefill, gdn_scan, hyper_connection, qsa_decode
 
 
 class DiskEmbedding(torch.nn.Module):
@@ -209,6 +209,40 @@ def apply():
         return forward
 
     _patch(m.Qwen4ExpTextQSAIndexer, "forward", indexer_forward)
+
+    def attention_forward(original):
+        # TODO(portability): Metal-only decode step (MPS); other backends keep the original forward.
+        # One query token past the indexer's budget: attend to the selected blocks only (no mask over the whole cache).
+        def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
+            if (
+                hidden_states.device.type == "mps"
+                and hidden_states.shape[:2] == (1, 1)
+                and past_key_values is not None
+                and attention_mask is not None
+                and attention_mask.dim() == 4
+                and attention_mask.shape[-1] > self.indexer.token_budget
+                and hidden_states.dtype in (torch.bfloat16, torch.float16)
+                and self.head_dim in (128, 256)
+                and not torch.is_grad_enabled()
+                and indexer.enabled()
+                and qsa_decode.enabled()
+            ):
+                selection = indexer.select(
+                    self.indexer,
+                    hidden_states,
+                    position_embeddings,
+                    attention_mask,
+                    past_key_values,
+                    m.apply_rotary_pos_emb,
+                    blocks_only=True,
+                )
+                if selection is not None:
+                    return qsa_decode.attention_forward(self, hidden_states, position_embeddings, past_key_values, *selection)
+            return original(self, hidden_states, position_embeddings, attention_mask, past_key_values, **kwargs)
+
+        return forward
+
+    _patch(m.Qwen4ExpTextAttention, "forward", attention_forward)
 
 
 def load_qwen38(

@@ -35,15 +35,65 @@ def _block_keys(indexer, raw_keys, full_cos, full_sin, first, last, apply_rotary
     ).squeeze(1)
 
 
-def select(indexer, hidden_states, position_embeddings, attention_mask, past_key_values, apply_rotary_pos_emb):
-    """``indexer.forward`` for a batch of one with a plain causal mask, else ``None`` (before any side effect)."""
+def _fused_ok(indexer, hidden_states):
+    from .kernels import qsa_decode
+
+    return (
+        hidden_states.device.type == "mps"
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and indexer.index_head_dim == 128
+        and indexer.index_kv_heads == 1
+        and indexer.index_n_heads <= 8
+        and qsa_decode.enabled()
+    )
+
+
+def _select_blocks_fused(indexer, hidden_states, position_embeddings, past_key_values, state, kv_length):
+    """``select(..., blocks_only=True)`` for a decode step continuing a checked sequence: the query norm + rotary and the
+    block scores as two kernels (the original runs ~35 small ops), the same cache update and block keys."""
+    from .kernels import qsa_decode
+
+    head_dim, heads, ratio = indexer.index_head_dim, indexer.index_n_heads, indexer.compress_ratio
+    full_cos, full_sin = position_embeddings
+    qk = indexer.index_qk_proj(hidden_states).reshape(-1)
+    query = qsa_decode.index_query(
+        qk, indexer.q_layernorm.weight, full_cos[0, -1], full_sin[0, -1], heads, indexer.q_layernorm.eps
+    )
+    raw_keys = past_key_values.update_indexer(qk[heads * head_dim :].view(1, 1, head_dim), indexer.layer_idx)
+    num_blocks = kv_length // ratio
+    block_keys = state[2]
+    if block_keys.shape[0] == num_blocks - 1:
+        new = _block_keys(indexer, raw_keys, full_cos, full_sin, num_blocks - 1, num_blocks, _rotary())
+        block_keys = torch.cat([block_keys, new])
+    elif block_keys.shape[0] != num_blocks:
+        block_keys = _block_keys(indexer, raw_keys, full_cos, full_sin, 0, num_blocks, _rotary())
+    top = qsa_decode.index_scores(query, block_keys).topk(min(indexer.block_topk, num_blocks)).indices
+    indexer._fast_state = (past_key_values, kv_length, block_keys)
+    return top, num_blocks * ratio
+
+
+def _rotary():
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
+
+    return apply_rotary_pos_emb
+
+
+def select(
+    indexer, hidden_states, position_embeddings, attention_mask, past_key_values, apply_rotary_pos_emb, blocks_only=False
+):
+    """``indexer.forward`` for a batch of one with a plain causal mask, else ``None`` (before any side effect).
+
+    ``blocks_only`` (one query token past the budget): return ``(selected block indices, tail start)`` instead of the
+    mask: the query attends to the ``compress_ratio`` tokens of each selected block and to every token from the tail
+    start on (the same tokens the mask selects)."""
+    if blocks_only and (hidden_states.shape[1] != 1 or attention_mask.shape[-1] // indexer.compress_ratio == 0):
+        return None
     batch_size, seq_length, _ = hidden_states.shape
     if batch_size != 1:
         return None
     visible = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
     kv_length = visible.shape[-1]
     past = kv_length - seq_length
-    expected = _causal(visible, past)
     # Decode steps continuing a sequence whose previous mask was checked: one more key, no new padding, so still plain
     # causal; skip the check (a host synchronization) and reuse the pooled keys of the complete blocks.
     state = getattr(indexer, "_fast_state", None)
@@ -54,6 +104,9 @@ def select(indexer, hidden_states, position_embeddings, attention_mask, past_key
         and state[0] is past_key_values
         and state[1] == kv_length - 1
     )
+    if blocks_only and continuing and visible.shape[1] == 1 and _fused_ok(indexer, hidden_states):
+        return _select_blocks_fused(indexer, hidden_states, position_embeddings, past_key_values, state, kv_length)
+    expected = _causal(visible, past)
     if visible.shape[1] != 1 or (not continuing and not torch.equal(visible[0, 0], expected)):
         indexer._fast_state = None
         return None
@@ -92,6 +145,9 @@ def select(indexer, hidden_states, position_embeddings, attention_mask, past_key
         valid = torch.arange(num_blocks, device=device)[None, :] < blocks_per_query[:, None]
         scores = scores.masked_fill(~valid, float("-inf"))
         top = scores.topk(min(indexer.block_topk, num_blocks), dim=1).indices
+        if blocks_only:
+            indexer._fast_state = (past_key_values, kv_length, block_keys) if past_key_values is not None else None
+            return top[0], num_blocks * ratio
         top_valid = valid.gather(1, top)
         tokens = top[..., None] * ratio + torch.arange(ratio, device=device)
         tokens = torch.where(top_valid[..., None], tokens, kv_length).reshape(seq_length, -1)

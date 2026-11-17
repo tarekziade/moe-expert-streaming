@@ -4,7 +4,8 @@
 applied by :func:`apply`:
 
 - the 51 GB hashed n-gram table read from disk row by row (:class:`DiskEmbedding`), instead of materialized;
-- decode on Apple GPUs: the Gated DeltaNet step and the hyper-connection step as Metal kernels;
+- on Apple GPUs: the Gated DeltaNet decode step, the hyper-connection step and the Gated DeltaNet output norm as Metal
+  kernels;
 - the QSA indexer skips token selection while every token fits its budget (2,048 keys), where it selects them all;
 - off Apple GPUs (CUDA), quantized experts run through :func:`mlx_affine.gather_qmm` (dequantize, then dense matmuls)
   instead of the slow per-expert PyTorch reference.
@@ -17,7 +18,7 @@ from pathlib import Path
 import torch
 
 from . import indexer, metal_linear, mlx_affine
-from .kernels import gated_delta_net, gdn_prefill, hyper_connection
+from .kernels import gated_delta_net, gated_norm, gdn_prefill, hyper_connection
 
 
 class DiskEmbedding(torch.nn.Module):
@@ -132,6 +133,17 @@ def apply():
         return forward
 
     _patch(m.Qwen4ExpTextGatedDeltaNet, "forward", gdn_forward)
+
+    def gated_norm_forward(original):
+        # TODO(portability): Metal-only (MPS); other backends keep the original forward.
+        def forward(self, hidden_states, gate):
+            if gated_norm.supports(self, hidden_states, gate):
+                return gated_norm.gated_rms_norm(self, hidden_states, gate)
+            return original(self, hidden_states, gate)
+
+        return forward
+
+    _patch(m.Qwen4ExpTextRMSNormGated, "forward", gated_norm_forward)
     # Prefill (and chunked prompts): the chunked delta rule on ggml's kernel instead of the PyTorch reference.
     _patch(m, "torch_chunk_gated_delta_rule", lambda original: gdn_prefill.wrap(original, m.l2norm))
 

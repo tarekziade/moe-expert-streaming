@@ -1056,7 +1056,9 @@ kernel void gguf_combine(
 #define INSTANTIATE_MPP2_ALL(NAME, BLOCK, NL) \
   INSTANTIATE_MPP2(NAME, BLOCK, NL, bfloat, "bfloat", 32) INSTANTIATE_MPP2(NAME, BLOCK, NL, bfloat, "bfloat", 64) \
   INSTANTIATE_MPP2(NAME, BLOCK, NL, float, "float", 32) INSTANTIATE_MPP2(NAME, BLOCK, NL, float, "float", 64) \
-  INSTANTIATE_MPP2(NAME, BLOCK, NL, half, "half", 32) INSTANTIATE_MPP2(NAME, BLOCK, NL, half, "half", 64)
+  INSTANTIATE_MPP2(NAME, BLOCK, NL, half, "half", 32) INSTANTIATE_MPP2(NAME, BLOCK, NL, half, "half", 64) \
+  INSTANTIATE_MPP2(NAME, BLOCK, NL, bfloat, "bfloat", 16) INSTANTIATE_MPP2(NAME, BLOCK, NL, float, "float", 16) \
+  INSTANTIATE_MPP2(NAME, BLOCK, NL, half, "half", 16)
 INSTANTIATE_MPP2_ALL(q2_0, block_q2_0, 4)
 INSTANTIATE_MPP2_ALL(iq2_xxs, block_iq2_xxs, QK_NL)
 INSTANTIATE_MPP2_ALL(iq2_xs, block_iq2_xs, QK_NL)
@@ -1067,4 +1069,5 @@ INSTANTIATE_MPP2_ALL(iq4_nl, block_iq4_nl, 2)
 template [[host_name("gguf_combine_bfloat")]] kernel void gguf_combine<bfloat>(device const float *, device const int *, device const float *, device bfloat *, device const uint *, uint);
 template [[host_name("gguf_combine_half")]] kernel void gguf_combine<half>(device const float *, device const int *, device const float *, device half *, device const uint *, uint);
 template [[host_name("gguf_combine_float")]] kernel void gguf_combine<float>(device const float *, device const int *, device const float *, device float *, device const uint *, uint);
+
 

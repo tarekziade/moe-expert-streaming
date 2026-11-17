@@ -27,20 +27,20 @@ _SOURCE = """
 #include <metal_stdlib>
 using namespace metal;
 
-// One threadgroup per stream: normed[s, h] = x[s, h] * rsqrt(mean(x[s, :]^2) + eps) * (1 + weight[s, h]).
+// One threadgroup per (token, stream) row: normed[r, h] = x[r, h] * rsqrt(mean(x[r, :]^2) + eps) * (1 + weight[r % count, h]).
 template <typename T>
 kernel void hc_norm(
     device const T* x [[buffer(0)]],
     device const T* weight [[buffer(1)]],
     device T* normed [[buffer(2)]],
-    device const float* params [[buffer(3)]],  // hidden, eps
+    device const float* params [[buffer(3)]],  // hidden, eps, count
     uint stream [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   const uint hidden = uint(params[0]);
-  const uint base = stream * hidden;
+  const uint base = stream * hidden, weight_base = (stream % uint(params[2])) * hidden;
   threadgroup float partial[32];
   float sum = 0.0f;
   for (uint h = tid; h < hidden; h += threads) {
@@ -54,7 +54,7 @@ kernel void hc_norm(
   for (uint s = 0; s < (threads + 31) / 32; ++s) sum += partial[s];
   const float scale = rsqrt(sum / float(hidden) + params[1]);
   for (uint h = tid; h < hidden; h += threads) {
-    normed[base + h] = T(float(x[base + h]) * scale * (1.0f + float(weight[base + h])));
+    normed[base + h] = T(float(x[base + h]) * scale * (1.0f + float(weight[weight_base + h])));
   }
 }
 
@@ -69,7 +69,8 @@ kernel void hc_act(
   a[i] = T(v / (1.0f + exp(-v)));
 }
 
-// mixed[h] = mean_s sigmoid(u[s, h]) * normed[s, h]; injection[s] = 2 * sigmoid(inject[s] / count).
+// Per token t: mixed[t, h] = mean_s sigmoid(u[t, s, h]) * normed[t, s, h]; injection[t, s] = 2 * sigmoid(inject[t, s] / count).
+// One thread per (t, h).
 template <typename T>
 kernel void hc_mix(
     device const T* u [[buffer(0)]],
@@ -78,19 +79,20 @@ kernel void hc_mix(
     device T* mixed [[buffer(3)]],
     device T* injection [[buffer(4)]],
     device const float* params [[buffer(5)]],  // hidden, count
-    uint h [[thread_position_in_grid]]) {
+    uint gid [[thread_position_in_grid]]) {
   const uint hidden = uint(params[0]), count = uint(params[1]);
+  const uint t = gid / hidden, h = gid % hidden;
   if (h < count) {
-    const float z = float(T(float(inject[h]) / params[1]));
-    injection[h] = T(2.0f * float(T(1.0f / (1.0f + exp(-z)))));
+    const float z = float(T(float(inject[t * count + h]) / params[1]));
+    injection[t * count + h] = T(2.0f * float(T(1.0f / (1.0f + exp(-z)))));
   }
-  if (h >= hidden) return;
+  const ulong base = ulong(t) * count * hidden;
   float acc = 0.0f;
   for (uint s = 0; s < count; ++s) {
-    const T gate = T(1.0f / (1.0f + exp(-float(u[s * hidden + h]))));
-    acc += float(T(float(gate) * float(normed[s * hidden + h])));
+    const T gate = T(1.0f / (1.0f + exp(-float(u[base + s * hidden + h]))));
+    acc += float(T(float(gate) * float(normed[base + s * hidden + h])));
   }
-  mixed[h] = T(acc / float(count));
+  mixed[ulong(t) * hidden + h] = T(acc / float(count));
 }
 
 #define INSTANTIATE(T, NAME)                                                                                    \\
@@ -121,10 +123,10 @@ def _params(values, device):
 # TODO(portability): Metal-only decode step (MPS), including the fused down/inject projection; other backends use
 # the PyTorch path.
 def supports(module, hyper_input):
-    """One token on MPS, with the combine projection (`use_combine`)."""
+    """Any number of tokens on MPS, with the combine projection (`use_combine`)."""
     return (
         hyper_input.device.type == "mps"
-        and hyper_input.numel() == module.hc_count * module.hidden_size
+        and hyper_input.numel() % (module.hc_count * module.hidden_size) == 0
         and hyper_input.dtype in _SUFFIX
         and module.block_inject_weight is not None
         and module.hc_norm.group_size == module.hidden_size
@@ -169,16 +171,19 @@ def gated_residual_step(module, hyper_input):
     count, hidden = module.hc_count, module.hidden_size
     device = hyper_input.device
     x = hyper_input.contiguous()
+    tokens = x.numel() // (count * hidden)
     normed = torch.empty_like(x)
     getattr(library, f"hc_norm_{suffix}")(
         x,
         module.hc_norm.weight.to(x.dtype),
         normed,
-        _params((float(hidden), module.hc_norm.eps), device),
-        threads=count * 256,
+        _params((float(hidden), module.hc_norm.eps, float(count)), device),
+        threads=tokens * count * 256,
         group_size=256,
     )
-    fused = _fused_projections(module)
+    # The fused call uses quantized_matmul in the input dtype: correct for one row, but wrong on M5 GPUs for bf16/f16
+    # inputs with many rows (kernels-community#1332); MetalLinear.forward computes those in float32.
+    fused = _fused_projections(module) if tokens == 1 else None
     if fused is not None:
         from ..metal_linear import load_metal_kernel
 
@@ -195,6 +200,6 @@ def gated_residual_step(module, hyper_input):
     mixed = torch.empty(*x.shape[:-1], hidden, dtype=x.dtype, device=device)
     injection = torch.empty_like(inject)
     getattr(library, f"hc_mix_{suffix}")(
-        up, normed, inject, mixed, injection, _params((float(hidden), float(count)), device), threads=hidden
+        up, normed, inject, mixed, injection, _params((float(hidden), float(count)), device), threads=tokens * hidden
     )
     return mixed, hyper_input, injection

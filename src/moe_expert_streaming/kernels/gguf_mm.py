@@ -96,3 +96,16 @@ def combine(routed, pos, weights, dtype):
         _combine_params(tokens, hidden, top_k, routed.device), threads=tokens * hidden // 4,
     )
     return y
+
+
+def split_tiles(counts, slots, starts, tile_rows=32, tail_rows=16):
+    """Tiles of ``tile_rows`` plus, where an expert's last tile would hold at most ``tail_rows`` routes, a
+    ``tail_rows`` tile instead (less padding: ~40 routes per expert per 2K-token chunk). Returns ``(tiles, tails)``."""
+    counts = counts.to(torch.int64)
+    remainder = counts % tile_rows
+    short = (remainder > 0) & (remainder <= tail_rows)
+    full = counts - torch.where(short, remainder, 0)
+    tails_counts = torch.where(short, remainder, 0)
+    tiles = tiles_for(full, slots, starts, tile_rows)
+    tails = tiles_for(tails_counts, slots, starts.to(torch.int64) + full, tail_rows)
+    return tiles, tails

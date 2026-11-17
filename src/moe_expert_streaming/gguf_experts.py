@@ -21,6 +21,7 @@ import os
 import re
 import struct
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -137,8 +138,12 @@ class GgufExpertStore:
         self.inflight = []
         self.commit = True
         self.hits = self.misses = self.evictions = self.not_admitted = 0
-        self.prefetched = self.prefetch_used = 0
+        self.prefetched = self.prefetch_used = self.installed_ahead = 0
         self.kernel = load_kernel()
+        # GGUF_EXPERTS_PROFILE=1: host seconds per phase of the experts forward, in stats()
+        self.clock = None
+        if os.environ.get("GGUF_EXPERTS_PROFILE") == "1":
+            self.clock = {"routing_sync": 0.0, "install": 0.0, "compute_launch": 0.0, "calls": 0}
 
     @staticmethod
     def _row_bytes(ggml_type, columns):
@@ -201,6 +206,26 @@ class GgufExpertStore:
             size_class.cache.move_to_end(key)
             return slot
         self.misses += 1
+        return self._install(prefix, expert, pinned)
+
+    def install_ahead(self, prefix, experts, pinned=()):
+        """Install the experts of ``prefix`` whose reads already finished, without waiting or counting lookups: their
+        copies queue behind the device work already submitted (which may still read the slots they replace; the
+        device runs the queue in order)."""
+        installed = 0
+        for expert in experts:
+            key = (prefix, expert)
+            future = self.pending.get(key)
+            if future is None or not future.done() or key in self.class_of[prefix].cache:
+                continue
+            if self._install(prefix, expert, pinned) is None:
+                break
+            installed += 1
+        self.installed_ahead += installed
+        return installed
+
+    def _install(self, prefix, expert, pinned=()):
+        size_class, key = self.class_of[prefix], (prefix, expert)
         if size_class.free:
             slot = size_class.free.pop()
         else:
@@ -244,9 +269,11 @@ class GgufExpertStore:
             "size_classes": len(self.classes),
             "prefetched": self.prefetched,
             "prefetch_used": self.prefetch_used,
+            "installed_ahead": self.installed_ahead,
             "resident_bytes": sum(len(c.cache) * c.expert_bytes for c in self.classes),
             "read_bytes": self.file.read_bytes,
             "read_calls": self.file.read_calls,
+            **({f"clock_{k}": v for k, v in self.clock.items()} if self.clock is not None else {}),
         }
 
     # ---- compute
@@ -331,8 +358,9 @@ def _tiled_forward(module, store, size_class, hidden_states, top_k_index, top_k_
     starts = torch.cumsum(counts, 0) - counts
     table = store.slot_tables[prefix]
     resident = table < size_class.num_slots
-    store.inflight.append(table.clone())  # read by the copy below until the next sync
-    slots = table.to(device, non_blocking=True).to(torch.int64)
+    snapshot = table.clone()  # the copy below runs later; install_ahead may change `table` before then
+    store.inflight.append(snapshot)
+    slots = snapshot.to(device, non_blocking=True).to(torch.int64)
     calls = [(size_class.gate_up, size_class.down, gguf_mm.tiles_for(counts * resident.to(device), slots, starts))]
     extra = [expert for expert in experts if not resident[expert]]
     if extra:
@@ -358,6 +386,10 @@ def _tiled_forward(module, store, size_class, hidden_states, top_k_index, top_k_
 
 
 PREFILL_TILE_ROWS = int(os.environ.get("GGUF_EXPERTS_TILE_ROWS", "32"))
+# Prefill: queue the next layer's finished reads into the pool behind this layer's compute.
+PREFILL_INSTALL_AHEAD = os.environ.get("GGUF_EXPERTS_INSTALL_AHEAD", "1") == "1"
+# 16-row tiles for each expert's last <= 16 routes (0 disables).
+PREFILL_TAIL_ROWS = int(os.environ.get("GGUF_EXPERTS_TAIL_ROWS", "16"))
 
 
 def _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts):
@@ -376,9 +408,16 @@ def _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top
     starts = torch.cumsum(counts, 0) - counts
     table = store.slot_tables[prefix]
     resident = table < size_class.num_slots
-    store.inflight.append(table.clone())  # read by the copy below until the next sync
-    slots = table.to(device, non_blocking=True).to(torch.int64)
-    calls = [(size_class.gate_up, size_class.down, gguf_mm.tiles_for(counts * resident.to(device), slots, starts, tile_rows))]
+    snapshot = table.clone()  # the copy below runs later; install_ahead may change `table` before then
+    store.inflight.append(snapshot)
+    slots = snapshot.to(device, non_blocking=True).to(torch.int64)
+    def tile_lists(selected_counts, bank_slots):
+        if PREFILL_TAIL_ROWS:
+            tiles, tails = gguf_mm.split_tiles(selected_counts, bank_slots, starts, tile_rows, PREFILL_TAIL_ROWS)
+            return [(tiles, tile_rows), (tails, PREFILL_TAIL_ROWS)]
+        return [(gguf_mm.tiles_for(selected_counts, bank_slots, starts, tile_rows), tile_rows)]
+
+    calls = [(size_class.gate_up, size_class.down, tile_lists(counts * resident.to(device), slots))]
     extra = [expert for expert in experts if not resident[expert]]
     if extra:
         blocks = [store.expert_blocks(prefix, expert) for expert in extra]
@@ -386,17 +425,19 @@ def _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top
         index[extra] = torch.arange(len(extra))
         mask = torch.zeros(store.num_experts, dtype=counts.dtype)
         mask[extra] = 1
-        tiles = gguf_mm.tiles_for(counts * mask.to(device), index.to(device), starts, tile_rows)
-        calls.append((torch.stack([b[0] for b in blocks]), torch.stack([b[1] for b in blocks]), tiles))
+        lists = tile_lists(counts * mask.to(device), index.to(device))
+        calls.append((torch.stack([b[0] for b in blocks]), torch.stack([b[1] for b in blocks]), lists))
     gate_up = torch.empty(order.numel(), 2 * store.intermediate, dtype=torch.float32, device=device)
-    for bank, _, tiles in calls:
-        gguf_mm.mm_rows(bank, size_class.gate_type, hidden_states, source, tiles, tile_rows, out=gate_up)
+    for bank, _, lists in calls:
+        for tiles, rows in lists:
+            gguf_mm.mm_rows(bank, size_class.gate_type, hidden_states, source, tiles, rows, out=gate_up)
     activated = module._apply_gate(gate_up)  # float32: +0.4 ms per 2K-token layer, rel err 1.7e-3 instead of 2.3e-3
     del gate_up
     identity = torch.arange(order.numel(), device=device, dtype=torch.int32)
     down = torch.empty(order.numel(), store.hidden, dtype=torch.float32, device=device)
-    for _, bank, tiles in calls:
-        gguf_mm.mm_rows(bank, size_class.down_type, activated, identity, tiles, tile_rows, out=down)
+    for _, bank, lists in calls:
+        for tiles, rows in lists:
+            gguf_mm.mm_rows(bank, size_class.down_type, activated, identity, tiles, rows, out=down)
     return gguf_mm.combine(down, position.view(tokens, top_k), top_k_weights, hidden_states.dtype)
 
 
@@ -405,12 +446,19 @@ def gguf_experts_forward(module, hidden_states, top_k_index, top_k_weights):
     from transformers.integrations.experts_offload import _commit_mps
 
     store, prefix = module.offload_store, module.offload_prefix
+    clock = store.clock
+    if clock is not None:
+        start = time.perf_counter()
     routing = top_k_index.cpu()  # also waits for earlier host-to-device copies
+    if clock is not None:
+        clock["routing_sync"] += time.perf_counter() - start
+        start = time.perf_counter()
     store.release_host_buffers()
     experts = torch.unique(routing).tolist()
     store.prefetch(prefix, experts[: store.window])
     readahead = module.offload_readahead_routes
-    if readahead and module.offload_next_prefix is not None and top_k_index.numel() >= readahead:
+    readahead_next = readahead and module.offload_next_prefix is not None and top_k_index.numel() >= readahead
+    if readahead_next:
         store.prefetch(module.offload_next_prefix, range(store.num_experts))
     size_class = store.class_of[prefix]
     try:
@@ -419,6 +467,9 @@ def gguf_experts_forward(module, hidden_states, top_k_index, top_k_weights):
             store.prefetch(prefix, experts[position + 1 : position + 1 + store.window])
             if store.acquire(prefix, expert, pinned) is not None:
                 pinned.add((prefix, expert))
+        if clock is not None:
+            clock["install"] += time.perf_counter() - start
+            start = time.perf_counter()
         if top_k_index.numel() <= GEMV_MAX_ROUTES and len(pinned) == len(experts):
             result = _gemv_forward(module, store, size_class, hidden_states, routing, top_k_weights)
         elif hidden_states.device.type == "mps":
@@ -429,6 +480,13 @@ def gguf_experts_forward(module, hidden_states, top_k_index, top_k_weights):
         store.discard(prefix)
     if store.commit:
         _commit_mps(store)
+    if readahead_next and PREFILL_INSTALL_AHEAD:
+        # The next layer's reads started above; queue the finished ones' copies behind this layer's compute so that
+        # layer finds them installed instead of copying while the device idles after its routing sync.
+        store.install_ahead(module.offload_next_prefix, range(store.num_experts))
+    if clock is not None:
+        clock["compute_launch"] += time.perf_counter() - start
+        clock["calls"] += 1
     return result
 
 

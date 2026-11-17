@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 
 from . import indexer, metal_linear, mlx_affine
-from .kernels import gated_delta_net, gated_norm, gdn_prefill, hyper_connection
+from .kernels import gated_delta_net, gated_norm, gdn_prefill, gdn_scan, hyper_connection
 
 
 class DiskEmbedding(torch.nn.Module):
@@ -146,6 +146,29 @@ def apply():
     _patch(m.Qwen4ExpTextRMSNormGated, "forward", gated_norm_forward)
     # Prefill (and chunked prompts): the chunked delta rule on ggml's kernel instead of the PyTorch reference.
     _patch(m, "torch_chunk_gated_delta_rule", lambda original: gdn_prefill.wrap(original, m.l2norm))
+
+    def conv_forward(original):
+        # TODO(portability): Metal-only (MPS); other backends keep the original function.
+        # Token-major output: the q / k / v views the delta rule reads are then rows, not columns.
+        def causal_conv1d_fn(hidden_states, weight, bias=None, activation=None, **kwargs):
+            if (
+                hidden_states.device.type == "mps"
+                and bias is None
+                and activation == "silu"
+                and weight.dim() == 2
+                and weight.shape[-1] == 4
+                and weight.dtype == hidden_states.dtype
+                and hidden_states.dtype in (torch.bfloat16, torch.float16)
+                and not any(v is not None for v in kwargs.values())
+                and not torch.is_grad_enabled()
+                and gdn_prefill.enabled()
+            ):
+                return gdn_scan.conv_silu(hidden_states, weight)
+            return original(hidden_states, weight, bias, activation=activation, **kwargs)
+
+        return causal_conv1d_fn
+
+    _patch(m, "causal_conv1d_fn", conv_forward)
 
     def residual_forward(original):
         # TODO(portability): Metal-only decode step (MPS); other backends keep the original forward.

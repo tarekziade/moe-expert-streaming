@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Metal kernels for one decode step of a gated hyper-connection (Qwen3.8's `GatedResidual`) on MPS.
+"""Metal kernels for a gated hyper-connection (Qwen3.8's `GatedResidual`) on MPS.
 
 The reference runs ~25 small ops per call around its three projections; here the group RMSNorm, the SiLU of the
 low-rank code and the stream mixing (with the injection weights) are one dispatch each, and the projections keep

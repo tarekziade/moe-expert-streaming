@@ -1,4 +1,4 @@
-"""Gated DeltaNet prefill on ``ggml-org/ggml-gated-delta-net`` (MPS).
+"""Gated DeltaNet prefill on our scan kernel (:mod:`.gdn_scan`, head dim 128) or ``ggml-org/ggml-gated-delta-net`` (MPS).
 
 Without ``flash-linear-attention`` (Triton, not on Apple GPUs) Transformers runs the chunked gated delta rule as a PyTorch
 reference: 6.7 s of a 4K-token prefill of Qwen3.8-Flash-Next. ggml's kernel runs the recurrence for a whole chunk of
@@ -11,6 +11,8 @@ import functools
 import os
 
 import torch
+
+from . import gdn_scan
 
 
 @functools.cache
@@ -61,6 +63,22 @@ def wrap(original, l2norm):
         dtype = query.dtype
         batch, _, k_heads, _ = query.shape
         v_heads = value.shape[2]
+        if (
+            head_dim == gdn_scan.HEAD_DIM
+            and v_heads % k_heads == 0
+            and use_qk_l2norm_in_kernel
+            and os.environ.get("MOE_STREAMING_GDN_SCAN", "1") == "1"
+        ):
+            # Our kernels (3x ggml's at 2K tokens on an M5): same (key, value) state layout as the reference.
+            if initial_state is None:
+                state = torch.zeros(batch, v_heads, head_dim, head_dim, dtype=torch.float32, device=query.device)
+            else:
+                state = initial_state.float().contiguous()
+                if state.data_ptr() == initial_state.data_ptr():
+                    state = state.clone()
+            qn, kn, kq = gdn_scan.prep_qk(query, key)
+            out = gdn_scan.scan(qn, kn, kq, value, g, beta, state)
+            return out.to(dtype), state if output_final_state else None
         query, key = query.float(), key.float()
         if use_qk_l2norm_in_kernel:
             query, key = l2norm(query, dim=-1, eps=1e-6), l2norm(key, dim=-1, eps=1e-6)

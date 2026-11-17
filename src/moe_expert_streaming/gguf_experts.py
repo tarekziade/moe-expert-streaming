@@ -1,19 +1,17 @@
-"""Routed experts in their GGUF quantization (Strata's IQ2/IQ3 gate/up, IQ4_NL or Q2_0 down), streamed from its
-``.experts`` file into a device cache of per-size-class slot pools.
+"""Routed experts in their GGUF quantization (Strata's IQ2/IQ3 gate/up, IQ4_NL or Q2_0 down), streamed by the
+``experts_offload`` store from Strata's ``.experts`` file.
 
 Strata's ``<gguf>.experts`` file holds every expert's gate, up and down GGUF blocks contiguous (one read per expert):
 header ``"STRX"``, u32 version (1), u32 layers, u32 experts, u64 source GGUF size; at byte 64 one ``(offset, gate
 bytes, up bytes, down bytes)`` u64 row per layer; expert ``e`` of layer ``l`` at ``offset + e * (gate + up + down)``.
 Gate and up share a type in every layer, so ``gate | up`` is one ``(2 * intermediate, row_bytes)`` matrix.
 
-Expert sizes differ by layer (1.36 to 2.33 MB for Qwen3.8-Flash-Next), so the cache is one pool per size class (as
-Strata's arena), each with an LRU and as many slots per layer on average: ``cache_bytes // sum(expert bytes over
-layers)`` slots per layer.
-
-Decode runs ggml's ``mul_mat_id`` (``ggml-org/ggml-quantization``) on the pools directly, and :mod:`.kernels.q2_0` for
-Q2_0 down projections. Prefill dequantizes a group of experts at a time and runs dense matmuls.
-
-:func:`attach` replaces the ``experts_offload`` store of a loaded model by a :class:`GgufExpertStore`.
+:class:`GgufExpertSource` is the store's ``expert_source``: expert sizes differ by layer (1.36 to 2.33 MB for
+Qwen3.8-Flash-Next), so the store keeps one pool per layout (as Strata's arena), with the same number of slots per
+layer. :func:`compute` is its ``expert_compute``: decode runs ggml's ``mul_mat_id`` (``ggml-org/ggml-quantization``)
+on the pools directly, and :mod:`.kernels.q2_0` for Q2_0 down projections; prefill runs the tile kernels of
+:mod:`.kernels.gguf_mm` (or, off MPS, dequantizes a group of experts at a time). :func:`offload_options` gives the
+``experts_offload`` options.
 """
 
 import fcntl
@@ -21,9 +19,6 @@ import os
 import re
 import struct
 import threading
-import time
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -45,7 +40,6 @@ GEMV_MAX_ROUTES = 512
 # story prompts unchanged (their prompts are short). 0 turns it off.
 COLD_PREFILL_TOKENS = int(os.environ.get("GGUF_EXPERTS_COLD_PREFILL", "512"))
 PREFILL_EXPERT_GROUP = 32
-IMPLEMENTATION = "experts_offload_gguf"
 
 
 class ExpertsFile:
@@ -87,250 +81,131 @@ class ExpertsFile:
         return out
 
 
-class _SizeClass:
-    """The slot pools of the layers whose experts share a layout."""
+class GgufExpertSource:
+    """The ``experts_offload`` store's ``expert_source`` for Strata's ``.experts`` file: per layer, the experts' ggml
+    types (from the GGUF) and their layout, ``[(2 * intermediate, gate row bytes), (hidden, down row bytes)]`` uint8."""
 
-    def __init__(self, layout, hidden, intermediate, num_slots, device):
-        self.gate_type, self.gate_row_bytes, self.down_type, self.down_row_bytes = layout
-        self.gate_up_bytes = 2 * intermediate * self.gate_row_bytes
-        self.expert_bytes = self.gate_up_bytes + hidden * self.down_row_bytes
-        self.num_slots = num_slots
-        self.gate_up = torch.empty((num_slots, 2 * intermediate, self.gate_row_bytes), dtype=torch.uint8, device=device)
-        self.down = torch.empty((num_slots, hidden, self.down_row_bytes), dtype=torch.uint8, device=device)
-        self.cache = OrderedDict()  # (prefix, expert) -> slot, least recently used first
-        self.free = list(range(num_slots - 1, -1, -1))
-
-
-class GgufExpertStore:
-    """The ``experts_offload`` store's role for GGUF experts: per-size-class LRU pools on the device."""
-
-    def __init__(self, experts_file, gguf, modules, cache_bytes, device, io_threads=8):
-        """``modules``: ``[(prefix, experts module)]``; ``gguf``: a :class:`GgufFile` with the expert tensor types."""
+    def __init__(self, experts_file, gguf, hidden, intermediate):
         self.file = experts_file
-        self.device = torch.device(device)
-        self.layer_of, self.class_of = {}, {}
-        layouts = {}
-        for prefix, module in modules:
+        self.gguf = gguf
+        self.hidden, self.intermediate = hidden, intermediate
+        self.info = {}  # prefix -> (layer, gate type, gate row bytes, down type, down row bytes)
+
+    @property
+    def read_bytes(self):
+        return self.file.read_bytes
+
+    @property
+    def read_calls(self):
+        return self.file.read_calls
+
+    def prefix(self, module_name):
+        return module_name
+
+    def _info(self, prefix):
+        info = self.info.get(prefix)
+        if info is None:
             layer = int(re.search(r"layers\.(\d+)\.", prefix).group(1))
-            hidden, intermediate = module.hidden_dim, module.intermediate_dim
-            _, gate_bytes, up_bytes, down_bytes = experts_file.layers[layer]
-            types = [gguf.tensors[f"blk.{layer}.ffn_{p}_exps.weight"][3] for p in ("gate", "up", "down")]
+            _, gate_bytes, up_bytes, down_bytes = self.file.layers[layer]
+            types = [self.gguf.tensors[f"blk.{layer}.ffn_{p}_exps.weight"][3] for p in ("gate", "up", "down")]
             if types[0] != types[1] or gate_bytes != up_bytes:
                 raise ValueError(f"layer {layer}: gate and up differ ({types[:2]})")
-            row_bytes = [self._row_bytes(t, c) for t, c in ((types[0], hidden), (types[2], intermediate))]
-            if (gate_bytes, down_bytes) != (row_bytes[0] * intermediate, row_bytes[1] * hidden):
+            rows = [_row_bytes(types[0], self.hidden), _row_bytes(types[2], self.intermediate)]
+            if (gate_bytes, down_bytes) != (rows[0] * self.intermediate, rows[1] * self.hidden):
                 raise ValueError(f"layer {layer}: .experts sizes do not match the GGUF types {types}")
-            if module.num_experts != experts_file.num_experts:
-                raise ValueError(f"layer {layer}: {module.num_experts} experts, the file has {experts_file.num_experts}")
-            self.layer_of[prefix] = layer
-            layouts.setdefault((types[0], row_bytes[0], types[2], row_bytes[1]), []).append(prefix)
-        self.hidden, self.intermediate, self.num_experts = hidden, intermediate, module.num_experts
-        per_layer = cache_bytes // sum(experts_file.expert_bytes(layer) for layer in self.layer_of.values())
-        self.slots_per_layer = per_layer
-        self.classes = []
-        for layout, prefixes in layouts.items():
-            size_class = _SizeClass(layout, hidden, intermediate, per_layer * len(prefixes), self.device)
-            self.classes.append(size_class)
-            for prefix in prefixes:
-                self.class_of[prefix] = size_class
-        # expert -> slot in its class (num_slots when absent), on the host
-        # Host buffers all of the largest expert size: one size keeps the pinned-memory allocator's cache small.
-        self.host_buffer_bytes = max(c.expert_bytes for c in self.classes)
-        self.host_buffers = []
-        self.slot_tables = {p: torch.full((self.num_experts,), c.num_slots, dtype=torch.int32) for p, c in self.class_of.items()}
-        self.executor = ThreadPoolExecutor(io_threads, thread_name_prefix="gguf-experts-io") if io_threads else None
-        self.window = 2 * io_threads
-        self.pending = {}
-        self.inflight = []
-        self.commit = True
-        self.hits = self.misses = self.evictions = self.not_admitted = 0
-        # set per call (long prefill): no refresh on hits, and the experts installed for a layer move to the LRU's cold
-        # end once that layer's call is done (installing them there directly would make every eviction scan past them)
-        self.cold = False
-        self.cold_installed = {}
-        self.prefetched = self.prefetch_used = self.installed_ahead = 0
-        self.kernel = load_kernel()
-        # GGUF_EXPERTS_PROFILE=1: host seconds per phase of the experts forward, in stats()
-        self.clock = None
-        if os.environ.get("GGUF_EXPERTS_PROFILE") == "1":
-            self.clock = {"routing_sync": 0.0, "install": 0.0, "compute_launch": 0.0, "calls": 0}
+            info = self.info[prefix] = (layer, types[0], rows[0], types[2], rows[1])
+        return info
 
-    @staticmethod
-    def _row_bytes(ggml_type, columns):
-        values, size = _BLOCKS[ggml_type]
-        return columns // values * size
+    def layout(self, prefix):
+        _, _, gate_row, _, down_row = self._info(prefix)
+        return [((2 * self.intermediate, gate_row), torch.uint8), ((self.hidden, down_row), torch.uint8)]
 
-    def all_resident(self):
-        return False
+    def pool_key(self, prefix):
+        return self._info(prefix)[1:]
 
-    # ---- reads
-    def _read_host(self, prefix, expert):
-        try:
-            buffer = self.host_buffers.pop()
-        except IndexError:
-            buffer = torch.empty(self.host_buffer_bytes, dtype=torch.uint8, pin_memory=self.device.type != "cpu")
-        return self.file.read(self.layer_of[prefix], expert, buffer[: self.class_of[prefix].expert_bytes])
+    def read(self, prefix, expert, out):
+        return self.file.read(self._info(prefix)[0], expert, out)
 
-    def prefetch(self, prefix, experts):
-        if self.executor is None:
-            return
-        size_class = self.class_of[prefix]
-        for expert in experts:
-            key = (prefix, expert)
-            if key not in size_class.cache and key not in self.pending:
-                self.pending[key] = self.executor.submit(self._read_host, prefix, expert)
-                self.prefetched += 1
 
-    def discard(self, prefix):
-        for key in [key for key in self.pending if key[0] == prefix]:
-            self.pending.pop(key).cancel()  # a read already done just drops its buffer
+def _row_bytes(ggml_type, columns):
+    values, size = _BLOCKS[ggml_type]
+    return columns // values * size
 
-    def _take_host(self, prefix, expert):
-        future = self.pending.pop((prefix, expert), None)
-        if future is not None and not future.cancelled():
-            self.prefetch_used += 1
-            buffer = future.result()
-        else:
-            buffer = self._read_host(prefix, expert)
-        self.inflight.append(buffer)  # read by queued copies until the next sync
-        return buffer
 
-    def release_host_buffers(self):
-        """Called right after a host synchronization: queued copies have read their host buffers."""
-        for buffer in self.inflight:
-            if buffer.dtype == torch.uint8:
-                self.host_buffers.append(buffer._base if buffer._base is not None else buffer)
-        self.inflight.clear()
+_KERNEL = []
 
-    def synchronize(self):
-        torch.accelerator.synchronize()
-        self.release_host_buffers()
 
-    # ---- cache
-    def acquire(self, prefix, expert, pinned=()):
-        """The expert's slot in its class pool (installed on a miss), or None when every slot is pinned."""
-        size_class, key = self.class_of[prefix], (prefix, expert)
-        slot = size_class.cache.get(key)
-        if slot is not None:
-            self.hits += 1
-            if not self.cold:
-                size_class.cache.move_to_end(key)
-            return slot
-        self.misses += 1
-        return self._install(prefix, expert, pinned)
+def _kernel():
+    if not _KERNEL:
+        _KERNEL.append(load_kernel())
+    return _KERNEL[0]
 
-    def install_ahead(self, prefix, experts, pinned=()):
-        """Install the experts of ``prefix`` whose reads already finished, without waiting or counting lookups: their
-        copies queue behind the device work already submitted (which may still read the slots they replace; the
-        device runs the queue in order)."""
-        installed = 0
-        for expert in experts:
-            key = (prefix, expert)
-            future = self.pending.get(key)
-            if future is None or not future.done() or key in self.class_of[prefix].cache:
-                continue
-            if self._install(prefix, expert, pinned) is None:
-                break
-            installed += 1
-        self.installed_ahead += installed
-        return installed
 
-    def _install(self, prefix, expert, pinned=()):
-        size_class, key = self.class_of[prefix], (prefix, expert)
-        if size_class.free:
-            slot = size_class.free.pop()
-        else:
-            victim = next((k for k in size_class.cache if k not in pinned), None)
-            if victim is None:
-                self.not_admitted += 1
-                return None
-            slot = size_class.cache.pop(victim)
-            self.slot_tables[victim[0]][victim[1]] = size_class.num_slots
-            self.evictions += 1
-        buffer = self._take_host(prefix, expert)
-        split = size_class.gate_up_bytes
-        size_class.gate_up[slot].view(-1).copy_(buffer[:split], non_blocking=True)
-        size_class.down[slot].view(-1).copy_(buffer[split:], non_blocking=True)
-        size_class.cache[key] = slot
-        if self.cold:
-            self.cold_installed.setdefault(prefix, []).append(key)
-        self.slot_tables[prefix][expert] = slot
-        return slot
+def matmul_routes(blocks, ggml_type, x, ids, out_features):
+    """``out[r, s] = x[r] @ blocks[ids[r, s]].T``: ``(routes, slots, out_features)`` float32."""
+    if ggml_type == q2_0.GGML_TYPE:
+        rows, used = ids.shape
+        inputs = x if rows == ids.numel() else x.repeat_interleave(used, dim=0)
+        return q2_0.mul_mat_id(blocks, inputs, ids.reshape(-1), out_features).view(rows, used, out_features)
+    return _kernel().mul_mat_id(blocks, x, ids, ggml_type, out_features)
 
-    def demote(self, prefix):
-        """Move the experts installed for ``prefix`` by cold calls to the cold end of their LRU."""
-        cache = self.class_of[prefix].cache
-        for key in self.cold_installed.pop(prefix, ()):
-            if key in cache:
-                cache.move_to_end(key, last=False)
 
-    def expert_blocks(self, prefix, expert):
+def dequantize(blocks, ggml_type, columns, dtype):
+    """``(experts, rows, row_bytes)`` blocks -> ``(experts, rows, columns)``."""
+    if ggml_type == q2_0.GGML_TYPE:
+        return q2_0.dequantize(blocks, columns, dtype)
+    experts, rows, _ = blocks.shape
+    flat = _kernel().dequantize(blocks.reshape(experts * rows, -1), ggml_type, experts * rows, columns, dtype)
+    return flat.view(experts, rows, columns)
+
+
+class _Layer:
+    """What the compute paths need of one layer: its pool's banks and slot count, the ggml types, the dimensions."""
+
+    def __init__(self, module, store):
+        prefix = module.offload_prefix
+        pool = store.pool_of[prefix]
+        _, self.gate_type, _, self.down_type, _ = store.source._info(prefix)
+        self.gate_up, self.down = pool.banks
+        self.num_slots = pool.num_slots
+        self.table = store.host_slot_tables[prefix]
+        self.hidden, self.intermediate, self.num_experts = module.hidden_dim, module.intermediate_dim, module.num_experts
+
+    def blocks(self, store, prefix, expert):
         """``(gate_up, down)`` blocks of one expert on the device: pool views when cached, else read for one use."""
-        size_class = self.class_of[prefix]
-        slot = size_class.cache.get((prefix, expert))
-        if slot is not None:
-            return size_class.gate_up[slot], size_class.down[slot]
-        buffer = self._take_host(prefix, expert).to(self.device, non_blocking=True)
-        split = size_class.gate_up_bytes
-        return (
-            buffer[:split].view(2 * self.intermediate, size_class.gate_row_bytes),
-            buffer[split:].view(self.hidden, size_class.down_row_bytes),
-        )
-
-    def stats(self):
-        return {
-            "hits": self.hits,
-            "misses": self.misses,
-            "evictions": self.evictions,
-            "not_admitted": self.not_admitted,
-            "policy": "lru",
-            "slots": sum(c.num_slots for c in self.classes),
-            "slots_per_layer": self.slots_per_layer,
-            "size_classes": len(self.classes),
-            "prefetched": self.prefetched,
-            "prefetch_used": self.prefetch_used,
-            "installed_ahead": self.installed_ahead,
-            "resident_bytes": sum(len(c.cache) * c.expert_bytes for c in self.classes),
-            "read_bytes": self.file.read_bytes,
-            "read_calls": self.file.read_calls,
-            **({f"clock_{k}": v for k, v in self.clock.items()} if self.clock is not None else {}),
-        }
-
-    # ---- compute
-    def matmul_routes(self, blocks, ggml_type, x, ids, out_features):
-        """``out[r, s] = x[r] @ blocks[ids[r, s]].T``: ``(routes, slots, out_features)`` float32."""
-        if ggml_type == q2_0.GGML_TYPE:
-            rows, used = ids.shape
-            inputs = x if rows == ids.numel() else x.repeat_interleave(used, dim=0)
-            return q2_0.mul_mat_id(blocks, inputs, ids.reshape(-1), out_features).view(rows, used, out_features)
-        return self.kernel.mul_mat_id(blocks, x, ids, ggml_type, out_features)
-
-    def dequantize(self, blocks, ggml_type, columns, dtype):
-        """``(experts, rows, row_bytes)`` blocks -> ``(experts, rows, columns)``."""
-        if ggml_type == q2_0.GGML_TYPE:
-            return q2_0.dequantize(blocks, columns, dtype)
-        experts, rows, _ = blocks.shape
-        flat = self.kernel.dequantize(blocks.reshape(experts * rows, -1), ggml_type, experts * rows, columns, dtype)
-        return flat.view(experts, rows, columns)
+        return store.expert_tensors(prefix, expert)
 
 
-def _gemv_forward(module, store, size_class, hidden_states, routing, top_k_weights):
+def compute(module, store, hidden_states, top_k_index, top_k_weights, routing, experts, pinned):
+    """The store's ``expert_compute``: gemvs on the pools when every routed expert is resident (decode), else the
+    prefill paths."""
+    layer = module.__dict__.get("_gguf_layer")
+    if layer is None:
+        layer = module.__dict__["_gguf_layer"] = _Layer(module, store)  # pool banks exist once the store is materialized
+    if top_k_index.numel() <= GEMV_MAX_ROUTES and len(pinned) == len(experts):
+        return _gemv_forward(module, store, layer, hidden_states, routing, top_k_weights)
+    if hidden_states.device.type == "mps":
+        return _tiled_forward_v2(module, store, layer, hidden_states, top_k_index, top_k_weights, experts)
+    return _grouped_forward(module, store, layer, hidden_states, top_k_index, top_k_weights, experts)
+
+
+def _gemv_forward(module, store, layer, hidden_states, routing, top_k_weights):
     """Every routed expert resident: ``mul_mat_id`` on the class pools."""
     tokens, top_k = routing.shape
-    slots = store.slot_tables[module.offload_prefix][routing]
-    store.inflight.append(slots)  # read by the non-blocking copy below until the next sync
+    slots = layer.table[routing].to(torch.int32)
+    store.inflight.append((slots,))  # read by the non-blocking copy below until the next sync
     slots = slots.to(hidden_states.device, non_blocking=True)
-    gate_up = store.matmul_routes(
-        size_class.gate_up, size_class.gate_type, hidden_states, slots, 2 * store.intermediate
+    gate_up = matmul_routes(
+        layer.gate_up, layer.gate_type, hidden_states, slots, 2 * layer.intermediate
     )
     activated = module._apply_gate(gate_up.view(tokens * top_k, -1))
-    down = store.matmul_routes(
-        size_class.down, size_class.down_type, activated, slots.view(-1, 1), store.hidden
+    down = matmul_routes(
+        layer.down, layer.down_type, activated, slots.view(-1, 1), layer.hidden
     ).view(tokens, top_k, -1)
     return (down * top_k_weights[..., None].float()).sum(dim=1).to(hidden_states.dtype)
 
 
-def _grouped_forward(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts):
+def _grouped_forward(module, store, layer, hidden_states, top_k_index, top_k_weights, experts):
     """Prefill: groups of experts dequantized, routes sorted by expert, padded batched matmuls."""
     prefix, top_k = module.offload_prefix, top_k_index.shape[1]
     device, dtype = hidden_states.device, hidden_states.dtype
@@ -338,13 +213,13 @@ def _grouped_forward(module, store, size_class, hidden_states, top_k_index, top_
     flat_index = top_k_index.reshape(-1)
     for start in range(0, len(experts), PREFILL_EXPERT_GROUP):
         group = experts[start : start + PREFILL_EXPERT_GROUP]
-        blocks = [store.expert_blocks(prefix, expert) for expert in group]
-        gate_up = store.dequantize(
-            torch.stack([b[0] for b in blocks]), size_class.gate_type, store.hidden, dtype
+        blocks = [layer.blocks(store, prefix, expert) for expert in group]
+        gate_up = dequantize(
+            torch.stack([b[0] for b in blocks]), layer.gate_type, layer.hidden, dtype
         )
-        down = store.dequantize(torch.stack([b[1] for b in blocks]), size_class.down_type, store.intermediate, dtype)
+        down = dequantize(torch.stack([b[1] for b in blocks]), layer.down_type, layer.intermediate, dtype)
         del blocks
-        lookup = torch.full((store.num_experts,), -1, dtype=torch.long, device=device)
+        lookup = torch.full((layer.num_experts,), -1, dtype=torch.long, device=device)
         lookup[torch.tensor(group, device=device)] = torch.arange(len(group), device=device)
         local = lookup[flat_index]
         selected = torch.nonzero(local >= 0).squeeze(1)
@@ -353,7 +228,7 @@ def _grouped_forward(module, store, size_class, hidden_states, top_k_index, top_
         counts = torch.bincount(rhs, minlength=len(group))
         width = int(counts.max())
         position = torch.arange(rhs.numel(), device=device) - (torch.cumsum(counts, 0) - counts)[rhs]
-        padded = hidden_states.new_zeros(len(group), width, store.hidden)
+        padded = hidden_states.new_zeros(len(group), width, layer.hidden)
         padded[rhs, position] = hidden_states[order // top_k]
         activated = module._apply_gate(torch.bmm(padded, gate_up.transpose(1, 2)))
         output = torch.bmm(activated, down.transpose(1, 2))[rhs, position].float()
@@ -363,7 +238,7 @@ def _grouped_forward(module, store, size_class, hidden_states, top_k_index, top_
     return result.to(dtype)
 
 
-def _tiled_forward(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts):
+def _tiled_forward(module, store, layer, hidden_states, top_k_index, top_k_weights, experts):
     """Prefill on MPS: routes sorted by expert, one tile GEMM per projection over the class pool (dequantizing in the
     kernel, :mod:`.kernels.gguf_mm`); experts that did not fit in the pool go through a temporary bank."""
     from .kernels import gguf_mm
@@ -374,31 +249,31 @@ def _tiled_forward(module, store, size_class, hidden_states, top_k_index, top_k_
     order = torch.argsort(flat, stable=True)
     tokens = order // top_k
     x = hidden_states[tokens].float()
-    counts = torch.bincount(flat, minlength=store.num_experts)
+    counts = torch.bincount(flat, minlength=layer.num_experts)
     starts = torch.cumsum(counts, 0) - counts
-    table = store.slot_tables[prefix]
-    resident = table < size_class.num_slots
+    table = layer.table
+    resident = table < layer.num_slots
     snapshot = table.clone()  # the copy below runs later; install_ahead may change `table` before then
-    store.inflight.append(snapshot)
+    store.inflight.append((snapshot,))
     slots = snapshot.to(device, non_blocking=True).to(torch.int64)
-    calls = [(size_class.gate_up, size_class.down, gguf_mm.tiles_for(counts * resident.to(device), slots, starts))]
+    calls = [(layer.gate_up, layer.down, gguf_mm.tiles_for(counts * resident.to(device), slots, starts))]
     extra = [expert for expert in experts if not resident[expert]]
     if extra:
-        blocks = [store.expert_blocks(prefix, expert) for expert in extra]
-        index = torch.zeros(store.num_experts, dtype=torch.int64)
+        blocks = [layer.blocks(store, prefix, expert) for expert in extra]
+        index = torch.zeros(layer.num_experts, dtype=torch.int64)
         index[extra] = torch.arange(len(extra))
-        mask = torch.zeros(store.num_experts, dtype=counts.dtype)
+        mask = torch.zeros(layer.num_experts, dtype=counts.dtype)
         mask[extra] = 1
         tiles = gguf_mm.tiles_for(counts * mask.to(device), index.to(device), starts)
         calls.append((torch.stack([b[0] for b in blocks]), torch.stack([b[1] for b in blocks]), tiles))
-    gate_up = torch.empty(x.shape[0], 2 * store.intermediate, dtype=torch.float32, device=device)
+    gate_up = torch.empty(x.shape[0], 2 * layer.intermediate, dtype=torch.float32, device=device)
     for bank, _, tiles in calls:
-        gguf_mm.mm_tiles(bank, size_class.gate_type, x, tiles, out=gate_up)
+        gguf_mm.mm_tiles(bank, layer.gate_type, x, tiles, out=gate_up)
     activated = module._apply_gate(gate_up)
     del gate_up, x
-    down = torch.empty(activated.shape[0], store.hidden, dtype=torch.float32, device=device)
+    down = torch.empty(activated.shape[0], layer.hidden, dtype=torch.float32, device=device)
     for _, bank, tiles in calls:
-        gguf_mm.mm_tiles(bank, size_class.down_type, activated, tiles, out=down)
+        gguf_mm.mm_tiles(bank, layer.down_type, activated, tiles, out=down)
     down *= top_k_weights.reshape(-1)[order, None].float()
     result = torch.zeros(hidden_states.shape, dtype=torch.float32, device=device)
     result.index_add_(0, tokens, down)
@@ -412,7 +287,7 @@ PREFILL_INSTALL_AHEAD = os.environ.get("GGUF_EXPERTS_INSTALL_AHEAD", "1") == "1"
 PREFILL_TAIL_ROWS = int(os.environ.get("GGUF_EXPERTS_TAIL_ROWS", "16"))
 
 
-def _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts):
+def _tiled_forward_v2(module, store, layer, hidden_states, top_k_index, top_k_weights, experts):
     """Prefill on MPS: routes sorted by expert; the tile GEMMs read the hidden states in place through a row index, and
     a combine kernel sums each token's routes (no gathered copy, no scatter)."""
     from .kernels import gguf_mm
@@ -424,12 +299,12 @@ def _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top
     source = (order // top_k).to(torch.int32)
     position = torch.empty_like(order)
     position[order] = torch.arange(order.numel(), device=device)
-    counts = torch.bincount(flat, minlength=store.num_experts)
+    counts = torch.bincount(flat, minlength=layer.num_experts)
     starts = torch.cumsum(counts, 0) - counts
-    table = store.slot_tables[prefix]
-    resident = table < size_class.num_slots
+    table = layer.table
+    resident = table < layer.num_slots
     snapshot = table.clone()  # the copy below runs later; install_ahead may change `table` before then
-    store.inflight.append(snapshot)
+    store.inflight.append((snapshot,))
     slots = snapshot.to(device, non_blocking=True).to(torch.int64)
     def tile_lists(selected_counts, bank_slots):
         if PREFILL_TAIL_ROWS:
@@ -437,79 +312,28 @@ def _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top
             return [(tiles, tile_rows), (tails, PREFILL_TAIL_ROWS)]
         return [(gguf_mm.tiles_for(selected_counts, bank_slots, starts, tile_rows), tile_rows)]
 
-    calls = [(size_class.gate_up, size_class.down, tile_lists(counts * resident.to(device), slots))]
+    calls = [(layer.gate_up, layer.down, tile_lists(counts * resident.to(device), slots))]
     extra = [expert for expert in experts if not resident[expert]]
     if extra:
-        blocks = [store.expert_blocks(prefix, expert) for expert in extra]
-        index = torch.zeros(store.num_experts, dtype=torch.int64)
+        blocks = [layer.blocks(store, prefix, expert) for expert in extra]
+        index = torch.zeros(layer.num_experts, dtype=torch.int64)
         index[extra] = torch.arange(len(extra))
-        mask = torch.zeros(store.num_experts, dtype=counts.dtype)
+        mask = torch.zeros(layer.num_experts, dtype=counts.dtype)
         mask[extra] = 1
         lists = tile_lists(counts * mask.to(device), index.to(device))
         calls.append((torch.stack([b[0] for b in blocks]), torch.stack([b[1] for b in blocks]), lists))
-    gate_up = torch.empty(order.numel(), 2 * store.intermediate, dtype=torch.float32, device=device)
+    gate_up = torch.empty(order.numel(), 2 * layer.intermediate, dtype=torch.float32, device=device)
     for bank, _, lists in calls:
         for tiles, rows in lists:
-            gguf_mm.mm_rows(bank, size_class.gate_type, hidden_states, source, tiles, rows, out=gate_up)
+            gguf_mm.mm_rows(bank, layer.gate_type, hidden_states, source, tiles, rows, out=gate_up)
     activated = module._apply_gate(gate_up)  # float32: +0.4 ms per 2K-token layer, rel err 1.7e-3 instead of 2.3e-3
     del gate_up
     identity = torch.arange(order.numel(), device=device, dtype=torch.int32)
-    down = torch.empty(order.numel(), store.hidden, dtype=torch.float32, device=device)
+    down = torch.empty(order.numel(), layer.hidden, dtype=torch.float32, device=device)
     for _, bank, lists in calls:
         for tiles, rows in lists:
-            gguf_mm.mm_rows(bank, size_class.down_type, activated, identity, tiles, rows, out=down)
+            gguf_mm.mm_rows(bank, layer.down_type, activated, identity, tiles, rows, out=down)
     return gguf_mm.combine(down, position.view(tokens, top_k), top_k_weights, hidden_states.dtype)
-
-
-def gguf_experts_forward(module, hidden_states, top_k_index, top_k_weights):
-    """The experts forward for a model whose store is a :class:`GgufExpertStore`."""
-    from transformers.integrations.experts_offload import _commit_mps
-
-    store, prefix = module.offload_store, module.offload_prefix
-    clock = store.clock
-    if clock is not None:
-        start = time.perf_counter()
-    routing = top_k_index.cpu()  # also waits for earlier host-to-device copies
-    if clock is not None:
-        clock["routing_sync"] += time.perf_counter() - start
-        start = time.perf_counter()
-    store.release_host_buffers()
-    experts = torch.unique(routing).tolist()
-    store.prefetch(prefix, experts[: store.window])
-    readahead = module.offload_readahead_routes
-    readahead_next = readahead and module.offload_next_prefix is not None and top_k_index.numel() >= readahead
-    if readahead_next:
-        store.prefetch(module.offload_next_prefix, range(store.num_experts))
-    size_class = store.class_of[prefix]
-    store.cold = COLD_PREFILL_TOKENS > 0 and top_k_index.shape[0] >= COLD_PREFILL_TOKENS
-    try:
-        pinned = set()
-        for position, expert in enumerate(experts):
-            store.prefetch(prefix, experts[position + 1 : position + 1 + store.window])
-            if store.acquire(prefix, expert, pinned) is not None:
-                pinned.add((prefix, expert))
-        if clock is not None:
-            clock["install"] += time.perf_counter() - start
-            start = time.perf_counter()
-        if top_k_index.numel() <= GEMV_MAX_ROUTES and len(pinned) == len(experts):
-            result = _gemv_forward(module, store, size_class, hidden_states, routing, top_k_weights)
-        elif hidden_states.device.type == "mps":
-            result = _tiled_forward_v2(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts)
-        else:
-            result = _grouped_forward(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts)
-    finally:
-        store.discard(prefix)
-        store.demote(prefix)
-    if store.commit:
-        _commit_mps(store)
-    if readahead_next and PREFILL_INSTALL_AHEAD:
-        # The next layer's reads started above; queue the finished ones' copies behind this layer's compute so that
-        # layer finds them installed instead of copying while the device idles after its routing sync.
-        store.install_ahead(module.offload_next_prefix, range(store.num_experts))
-    if clock is not None:
-        clock["compute_launch"] += time.perf_counter() - start
-        clock["calls"] += 1
-    return result
 
 
 def experts_path(gguf_path):
@@ -529,31 +353,19 @@ def gguf_shards(gguf_path):
     return [re.sub(r"-\d{5}-of-", f"-{i:05d}-of-", path) for i in range(1, total + 1)]
 
 
-def attach(model, gguf_path, cache_bytes, io_threads=8, bypass_page_cache=True, experts_file=None):
-    """Replace the model's ``experts_offload`` store by a :class:`GgufExpertStore` on the GGUF's experts."""
-    from transformers.integrations.moe import ExpertsInterface
-
-    ExpertsInterface.register(IMPLEMENTATION, gguf_experts_forward)
-    old = model.experts_offload_store
-    modules = [(m.offload_prefix, m) for _, m in model.named_modules() if getattr(m, "offload_store", None) is old]
-    store = GgufExpertStore(
+def offload_options(gguf_path, config, io_threads=8, bypass_page_cache=True, experts_file=None):
+    """``experts_offload`` options (without ``cache_bytes``) that stream the GGUF's experts from its ``.experts`` file."""
+    text = getattr(config, "text_config", config)
+    source = GgufExpertSource(
         ExpertsFile(experts_file or experts_path(gguf_path), bypass_page_cache),
         GgufFile(gguf_shards(gguf_path)),
-        modules,
-        cache_bytes,
-        old.device,
-        io_threads,
+        text.hidden_size,
+        text.moe_intermediate_size,
     )
-    store.commit = old.commit
-    if old.executor is not None:
-        old.executor.shutdown()
-    for _, module in modules:
-        module.offload_store = store
-        module.config._experts_implementation = IMPLEMENTATION
-    model.experts_offload_store = store
-    print(
-        f"gguf_experts: {len(store.classes)} size classes, {store.slots_per_layer} slots per layer, "
-        f"{sum(c.num_slots * c.expert_bytes for c in store.classes) / 2**30:.2f} GiB",
-        flush=True,
-    )
-    return store
+    return {
+        "expert_source": source,
+        "expert_compute": compute,
+        "io_threads": io_threads,
+        "cold_prefill_routes": COLD_PREFILL_TOKENS * text.num_experts_per_tok,
+        "prefill_install_ahead": PREFILL_INSTALL_AHEAD,
+    }

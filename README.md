@@ -20,11 +20,11 @@ The generic part lives in Transformers itself; this project adds what is not (ye
 
 | Piece | Where |
 |---|---|
-| `from_pretrained(..., experts_offload={...})`: expert cache, SSD reads, prefetch, quantized experts, early MPS commits | [huggingface/transformers#50717](https://github.com/huggingface/transformers/pull/50717) |
+| `from_pretrained(..., experts_offload={...})`: expert cache (one pool per expert layout), SSD reads, read-ahead, cold prefill installs, quantized experts, external expert sources, early MPS commits | [huggingface/transformers#50717](https://github.com/huggingface/transformers/pull/50717) |
 | `MetalConfig` dense layers on the v2 MLX kernels (`quantized_matmul`), MLX-exact quantization, ggml layer kernels | [huggingface/transformers#49467](https://github.com/huggingface/transformers/pull/49467), carried in `metal_linear.py` until merged |
 | Qwen3.8: the 51 GB n-gram table read from disk, Metal decode kernels (Gated DeltaNet, hyper-connections), QSA indexer shortcut and vectorized selection | this package (`qwen38.py`, `kernels/`) |
 | Dense layers from a GGUF file on ggml's kernels (`ggml-org/ggml-quantization`) | this package (`gguf_dense.py`) |
-| Routed experts from Strata's `.experts` file: per-size-class cache, ggml `mul_mat_id` for decode, a Q2_0 gemv and a `matmul2d` prefill kernel | this package (`gguf_experts.py`, `kernels/q2_0.py`, `kernels/gguf_mm.*`) |
+| Routed experts from Strata's `.experts` file: the store's `expert_source` and `expert_compute` (ggml `mul_mat_id` for decode, a Q2_0 gemv and a `matmul2d` prefill kernel) | this package (`gguf_experts.py`, `kernels/q2_0.py`, `kernels/gguf_mm.*`) |
 | Converter, benchmark, profiling and analysis scripts | this package (`scripts/`, `repro/`) |
 
 Patches are applied at the class level by `moe_expert_streaming.apply()`; nothing in Transformers is edited.
@@ -88,8 +88,9 @@ model = load_qwen38("/path/to/qwen38", cache_gib=12, dense_bits=8, gguf_dense="/
 `gguf_experts=True` (with `gguf_dense=`) streams the routed experts in Strata's quantization from the `.experts` file
 Strata writes beside the GGUF (every expert's gate, up and down blocks contiguous: one read per expert). They are 19%
 smaller than our 3-bit experts on average (1.36–2.33 MB by layer), so the same 12 GiB cache holds more of them and a
-miss reads fewer bytes. The cache has one pool per size class (10 for Qwen3.8), each an LRU with the same number of
-slots per layer, as Strata's arena.
+miss reads fewer bytes. The file is the `experts_offload` store's `expert_source`: the store keeps one pool per
+expert layout (10 for Qwen3.8), each an LRU with the same number of slots per layer, as Strata's arena, and does the
+reads, read-ahead and installs; `gguf_experts.compute` runs the experts on the pools.
 
 - Decode: ggml's `mul_mat_id` (`ggml-org/ggml-quantization`) on the pools; Q2_0 (30 layers' down projections, no Metal
   gemv in ggml) on our gather-gemv kernel (`kernels/q2_0.py`).

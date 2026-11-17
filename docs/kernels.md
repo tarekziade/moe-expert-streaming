@@ -23,7 +23,7 @@ Two options swap parts of it for Strata's GGUF (`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_
 | Option | Replaced | By | Kept from safetensors |
 |---|---|---|---|
 | `gguf_dense=<gguf path(s)>` (MPS) | the large dense projections: Gated DeltaNet `in_proj_qkv`, `in_proj_z`, `out_proj`; attention `q/k/v/o_proj`; shared-expert `gate/up/down_proj`; `lm_head` | `GgufLinear` (`gguf_dense.py`), the GGUF blocks as stored (Q4_K-Q6_K, IQ4_XS, IQ3_S, ...) | Gated DeltaNet `in_proj_a/b`, hyper-connections, routers, indexer, norms, embeddings; and any GGUF tensor of a type ggml's Metal gemv does not cover (8 projections in Q2_0, logged as `kept 8 (['type 42'])`) |
-| `gguf_experts=True` (needs `gguf_dense`) | the routed experts | Strata's `<gguf>.experts` file: IQ2/IQ3 gate/up, IQ4_NL or Q2_0 down, streamed into a per-size-class device cache (`gguf_experts.py`) | nothing for the experts (`experts-q3/` only gives the layout) |
+| `gguf_experts=True` (needs `gguf_dense`) | the routed experts | Strata's `<gguf>.experts` file: IQ2/IQ3 gate/up, IQ4_NL or Q2_0 down, streamed by the `experts_offload` store (`expert_source`, one pool per layout) and run by `gguf_experts.compute` | nothing for the experts (`experts-q3/` is not read) |
 
 The published numbers use both (`--gguf-dense G --gguf-experts` in `scripts/bench.py`). Without them the model runs
 on 8-bit `MetalConfig` dense layers and 3-bit MLX experts.
@@ -65,7 +65,6 @@ Attention itself is PyTorch SDPA (`attn_implementation="sdpa"`: the indexer's sp
 | `MOE_STREAMING_GGML_GDN_PREFILL=0` | Gated DeltaNet prefill on the PyTorch reference (conv and chunked delta rule) |
 | `MOE_STREAMING_FAST_INDEXER=0` | the model's own per-query QSA indexer selection |
 | `MOE_STREAMING_QSA_DECODE=0` | decode attention past the budget on the model's mask + SDPA (and the indexer's own ops) |
-| `GGUF_EXPERTS_COLD_PREFILL` | calls with at least this many tokens (default 512) leave their installs at the LRU's cold end and do not refresh hits; 0 turns it off |
+| `GGUF_EXPERTS_COLD_PREFILL` | calls with at least this many tokens (default 512) leave their installs at the LRU's cold end and do not refresh hits (the store's `cold_prefill_routes`); 0 turns it off |
 | `MOE_STREAMING_GDN_SCAN=0` | Gated DeltaNet prefill on `ggml-org/ggml-gated-delta-net` instead of `gdn_scan` |
 | `GGUF_EXPERTS_TILE_ROWS`, `GGUF_EXPERTS_TAIL_ROWS`, `GGUF_EXPERTS_INSTALL_AHEAD` | GGUF expert prefill tiling (32 / 16 / 1) |
-| `GGUF_EXPERTS_PROFILE=1` | host clocks of the GGUF expert prefill in the store stats |

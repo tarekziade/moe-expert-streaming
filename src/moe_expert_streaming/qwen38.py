@@ -270,8 +270,7 @@ def load_qwen38(
     guessing costs more than it hides (decode 11.1 -> 11.7 tok/s without it).
     ``gguf_dense``: GGUF file(s) whose quantized dense tensors replace the model's (see :mod:`gguf_dense`; MPS).
     ``gguf_experts``: run the routed experts in the GGUF's quantization, from Strata's ``.experts`` file beside it (see
-    :mod:`gguf_experts`; needs ``gguf_dense``). ``cache_gib`` then sizes their cache; ``experts-q{bits}/`` is only read
-    for its layout.
+    :mod:`gguf_experts`; needs ``gguf_dense``). ``cache_gib`` then sizes their cache (``experts-q{bits}/`` is not read).
     ``dense_bits``: ``"auto"`` = 8-bit ``MetalConfig`` on MPS, BF16 elsewhere; an int quantizes with ``MetalConfig``
     (MPS only); ``None`` keeps BF16.
     """
@@ -284,6 +283,19 @@ def load_qwen38(
     if dense_bits and not on_mps:
         raise ValueError("dense_bits needs MPS (MetalConfig); use dense_bits=None (BF16) on other devices")
     converted = Path(converted)
+    paths = [gguf_dense] if isinstance(gguf_dense, (str, Path)) else list(gguf_dense or [])
+    if gguf_experts:
+        from transformers import AutoConfig
+
+        from . import gguf_experts as gguf_experts_module
+
+        if not gguf_dense:
+            raise ValueError("gguf_experts needs gguf_dense (the GGUF the .experts file was made from)")
+        experts_options = gguf_experts_module.offload_options(
+            paths[0], AutoConfig.from_pretrained(converted / "dense"), io_threads, bypass_page_cache
+        )
+    else:
+        experts_options = {"quantized_experts": converted / f"experts-q{bits}"}
     with disk_ngram_table(converted / "ngram"):
         model = Qwen4ExpForCausalLM.from_pretrained(
             converted / "dense",
@@ -296,8 +308,7 @@ def load_qwen38(
                 else None
             ),
             experts_offload={
-                "cache_bytes": 0 if gguf_experts else int(cache_gib * 2**30),
-                "quantized_experts": converted / f"experts-q{bits}",
+                "cache_bytes": int(cache_gib * 2**30),
                 "io_threads": io_threads,
                 "cache_policy": cache_policy,
                 "bypass_page_cache": bypass_page_cache,
@@ -308,6 +319,7 @@ def load_qwen38(
                     if host_cache_gib
                     else {}
                 ),
+                **experts_options,
             },
         )
     if dense_bits and on_mps:
@@ -315,14 +327,13 @@ def load_qwen38(
     if gguf_dense:
         from . import gguf_dense as gguf_dense_module
 
-        paths = [gguf_dense] if isinstance(gguf_dense, (str, Path)) else list(gguf_dense)
         gguf_dense_module.replace_dense(model, paths)
     if gguf_experts:
-        from . import gguf_experts as gguf_experts_module
-
-        if not gguf_dense:
-            raise ValueError("gguf_experts needs gguf_dense (the GGUF the .experts file was made from)")
-        gguf_experts_module.attach(
-            model, paths[0], int(cache_gib * 2**30), io_threads=io_threads, bypass_page_cache=bypass_page_cache
+        store = model.experts_offload_store
+        print(
+            f"gguf_experts: {len(store.pools)} size classes, "
+            f"{store.pools[0].num_slots * store.layouts[next(iter(store.layouts))][2] // store.pools[0].num_experts} "
+            f"slots per layer, {sum(p.num_slots * p.slot_bytes for p in store.pools) / 2**30:.2f} GiB",
+            flush=True,
         )
     return model.eval()

@@ -94,6 +94,59 @@ kernel void qsa_decode_merge(
   for (int e = 0; e < E; ++e) out[h * D + lane * E + e] = T(acc[e] / L);
 }
 
+// indexer query of one token: per head (a simdgroup, 4 values a lane) RMSNorm in float32 times (1 + weight), rounded to
+// T, then the rotary embedding on the first `rot` dims in T arithmetic (x*cos and rotate_half(x)*sin rounded, then
+// their sum), as the model's Qwen4ExpTextRMSNorm + apply_rotary_pos_emb; out: float [heads, 128]
+template <typename T>
+kernel void qsa_index_q(
+    device const T* qk [[buffer(0)]], device const T* weight [[buffer(1)]], device const T* cos [[buffer(2)]],
+    device const T* sin [[buffer(3)]], device float* out [[buffer(4)]], device const float* params [[buffer(5)]],
+    ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+  threadgroup T normed[8][128];
+  const int rot = int(params[1]), half_rot = rot / 2;
+  float x[4], ss = 0.0f;
+  for (int e = 0; e < 4; ++e) { x[e] = float(qk[sg * 128 + lane * 4 + e]); ss += x[e] * x[e]; }
+  const float r = rsqrt(simd_sum(ss) / 128.0f + params[0]);
+  for (int e = 0; e < 4; ++e) {
+    const int d = lane * 4 + e;
+    normed[sg][d] = T(x[e] * r * (1.0f + float(weight[d])));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int e = 0; e < 4; ++e) {
+    const int d = lane * 4 + e;
+    T v = normed[sg][d];
+    if (d < rot) {
+      const T other = d < half_rot ? T(-float(normed[sg][d + half_rot])) : normed[sg][d - half_rot];
+      v = T(float(T(float(v) * float(cos[d]))) + float(T(float(other) * float(sin[d]))));
+    }
+    out[sg * 128 + d] = float(v);
+  }
+}
+
+// block scores: a simdgroup per block, score = sum over heads of relu(q_h . k) / sqrt(128)
+template <typename T>
+kernel void qsa_index_scores(
+    device const float* q [[buffer(0)]], device const T* keys [[buffer(1)]], device float* scores [[buffer(2)]],
+    device const uint* dims [[buffer(3)]],   // blocks, heads
+    uint tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]], ushort sgs [[simdgroups_per_threadgroup]]) {
+  const uint n = tg * sgs + sg;
+  if (n >= dims[0]) return;
+  float k[4];
+  for (int e = 0; e < 4; ++e) k[e] = float(keys[ulong(n) * 128 + lane * 4 + e]);
+  float total = 0.0f;
+  for (uint h = 0; h < dims[1]; ++h) {
+    float d = 0.0f;
+    for (int e = 0; e < 4; ++e) d = fma(q[h * 128 + lane * 4 + e], k[e], d);
+    total += max(simd_sum(d), 0.0f);
+  }
+  if (lane == 0) scores[n] = total / sqrt(128.0f);
+}
+template [[host_name("qsa_index_q_bfloat")]] kernel decltype(qsa_index_q<bfloat>) qsa_index_q<bfloat>;
+template [[host_name("qsa_index_q_half")]] kernel decltype(qsa_index_q<half>) qsa_index_q<half>;
+template [[host_name("qsa_index_scores_bfloat")]] kernel decltype(qsa_index_scores<bfloat>) qsa_index_scores<bfloat>;
+template [[host_name("qsa_index_scores_half")]] kernel decltype(qsa_index_scores<half>) qsa_index_scores<half>;
+
 #define INST(T, NAME, D) \\
   template [[host_name("qsa_decode_partial_" NAME "_" #D)]] kernel decltype(qsa_decode_partial<T, D>) qsa_decode_partial<T, D>; \\
   template [[host_name("qsa_decode_merge_" NAME "_" #D)]] kernel decltype(qsa_decode_merge<T, D>) qsa_decode_merge<T, D>;
@@ -109,6 +162,13 @@ TOKENS_PER_GROUP = 256
 @functools.cache
 def _library():
     return torch.mps.compile_shader(_SOURCE)
+
+
+@functools.lru_cache(maxsize=256)
+def _dims(values, device):
+    """Small int32 parameter tensors on the device, cached (decode steps repeat or slowly change them). Made with
+    ``device=``: a ``non_blocking`` copy from pageable memory may read the host tensor after it is freed."""
+    return torch.tensor(values, dtype=torch.int32, device=device)
 
 
 @functools.cache
@@ -137,10 +197,7 @@ def attention(query, key, value, blocks, ratio, tail_start, scaling):
     blocks = blocks.contiguous()
     selected = blocks.numel() * ratio + (length - tail_start)
     splits = max(1, -(-selected // TOKENS_PER_GROUP))
-    dims = torch.tensor(
-        [heads, kv_heads, blocks.numel(), ratio, tail_start, length * dim, selected, splits],
-        dtype=torch.int32,
-    ).to(query.device, non_blocking=True)
+    dims = _dims((heads, kv_heads, blocks.numel(), ratio, tail_start, length * dim, selected, splits), query.device)
     partial = torch.empty(heads * splits * (2 + dim), dtype=torch.float32, device=query.device)
     out = torch.empty(heads, dim, dtype=query.dtype, device=query.device)
     lib, name = _library(), f"{_SUFFIX[query.dtype]}_{dim}"
@@ -186,3 +243,31 @@ def attention_forward(module, hidden_states, position_embeddings, past_key_value
     attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1)
     attn_output = attn_output * torch.sigmoid(gate)
     return module.o_proj(attn_output), None
+
+
+@functools.cache
+def _index_params(eps, rot, device):
+    return torch.tensor([eps, rot], dtype=torch.float32, device=device)
+
+
+def index_query(qk, weight, cos, sin, heads, eps):
+    """The indexer's query of one token: ``qk`` [heads * 128 (+ more)] projection output, ``cos``/``sin`` [rot] of its
+    position; normalized and rotated as the model does, returned in float32 [heads, 128]."""
+    out = torch.empty(heads, 128, dtype=torch.float32, device=qk.device)
+    getattr(_library(), f"qsa_index_q_{_SUFFIX[qk.dtype]}")(
+        qk, weight, cos.contiguous(), sin.contiguous(), out, _index_params(float(eps), cos.shape[-1], qk.device),
+        threads=heads * 32, group_size=heads * 32,
+    )
+    return out
+
+
+def index_scores(query, block_keys):
+    """``query`` [heads, 128] float32, ``block_keys`` [blocks, 128]: sum over heads of relu(q . k) / sqrt(128)."""
+    blocks, heads = block_keys.shape[0], query.shape[0]
+    scores = torch.empty(blocks, dtype=torch.float32, device=query.device)
+    dims = _dims((blocks, heads), query.device)
+    getattr(_library(), f"qsa_index_scores_{_SUFFIX[block_keys.dtype]}")(
+        query, block_keys.contiguous(), scores, dims,
+        threads=-(-blocks // SIMDGROUPS) * SIMDGROUPS * 32, group_size=SIMDGROUPS * 32,
+    )
+    return scores

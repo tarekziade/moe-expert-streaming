@@ -161,7 +161,8 @@ def main():
     parser.add_argument(
         "--gguf-experts", action="store_true", help="Routed experts from the GGUF's Strata .experts file"
     )
-    parser.add_argument("--prefetch-depth", type=int, default=0, help="Layers ahead to guess and read experts")
+    parser.add_argument("--prefetch-depth", type=int, default=1, help="Layers ahead to guess and read experts")
+    parser.add_argument("--guess-limit", type=int, default=1, help="With --prefetch-depth: best guesses read per layer")
     parser.add_argument("--preload-profile", type=Path, default=None, help="Routing profile JSON to warm the cache")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -187,6 +188,7 @@ def main():
         gguf_experts=args.gguf_experts,
         prefetch_depth=args.prefetch_depth,
         preload_profile=args.preload_profile,
+        guess_limit=args.guess_limit,
     )
     load_s = time.perf_counter() - start
     after_load = device_memory()
@@ -203,6 +205,7 @@ def main():
         "gguf_dense": [str(p) for p in args.gguf_dense or []],
         "gguf_experts": args.gguf_experts,
         "prefetch_depth": args.prefetch_depth,
+        "guess_limit": args.guess_limit,
         "preload_profile": str(args.preload_profile) if args.preload_profile else None,
         "prefill_chunk_size": args.prefill_chunk_size,
         "torch": torch.__version__,

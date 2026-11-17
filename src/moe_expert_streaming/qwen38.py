@@ -259,16 +259,18 @@ def load_qwen38(
     host_cache_gib=0.0,
     host_preload=False,
     gguf_dense=None,
-    prefetch_depth=0,
+    prefetch_depth=1,
     gguf_experts=False,
     preload_profile=None,
+    guess_limit=1,
 ):
     """Load a checkpoint written by ``scripts/convert_fp8.py``: ``dense/``, ``experts-q{bits}/`` and ``ngram/``.
 
     ``host_cache_gib`` / ``host_preload``: a tier of experts in pinned host memory between storage and the device
     cache, as Strata keeps its experts in RAM (needs a transformers with the host tier; for discrete GPUs).
-    ``prefetch_depth``: layers ahead to guess and read experts (``experts_offload`` option). 0 by default: on the M5,
-    guessing costs more than it hides (decode 11.1 -> 11.7 tok/s without it).
+    ``prefetch_depth`` / ``guess_limit``: guess the next layer's experts with its router and read the best
+    ``guess_limit`` non-resident ones once this layer's reads are done (``experts_offload`` options). 1 / 1 by default:
+    +3% decode, +3% after a 6K document on the M5; reading every guess (``guess_limit=0``) costs more than it hides.
     ``gguf_dense``: GGUF file(s) whose quantized dense tensors replace the model's (see :mod:`gguf_dense`; MPS).
     ``gguf_experts``: run the routed experts in the GGUF's quantization, from Strata's ``.experts`` file beside it (see
     :mod:`gguf_experts`; needs ``gguf_dense``). ``cache_gib`` then sizes their cache (``experts-q{bits}/`` is not read).
@@ -324,6 +326,7 @@ def load_qwen38(
                 ),
                 **experts_options,
                 **({"preload_profile": preload_profile} if preload_profile else {}),
+                **({"guess_limit": guess_limit} if guess_limit else {}),
             },
         )
     if dense_bits and on_mps:

@@ -38,6 +38,12 @@ _BLOCKS = {16: (256, 66), 17: (256, 74), 18: (256, 98), 20: (32, 18), 21: (256, 
 # Routes up to which the experts run as gemvs on the pools (decode, short prompts); above, groups of experts are
 # dequantized (each dequantized expert is 9.8 MB of bf16, so groups stay small).
 GEMV_MAX_ROUTES = 512
+# Calls with at least this many tokens (long prefill chunks) leave the experts they install at the cold end of the LRU
+# and do not refresh the ones they hit: a chunk cycles through nearly every expert of a layer, more than its pool holds, so
+# plain LRU evicts each expert just before the next chunk needs it, and leaves decode a cache of scan leftovers. Replay
+# of a 6K-token document (2K chunks): prefill misses 50.2K -> 36.2K, misses per decode token after it 66.6 -> 61.5, the
+# story prompts unchanged (their prompts are short). 0 turns it off.
+COLD_PREFILL_TOKENS = int(os.environ.get("GGUF_EXPERTS_COLD_PREFILL", "512"))
 PREFILL_EXPERT_GROUP = 32
 IMPLEMENTATION = "experts_offload_gguf"
 
@@ -138,6 +144,10 @@ class GgufExpertStore:
         self.inflight = []
         self.commit = True
         self.hits = self.misses = self.evictions = self.not_admitted = 0
+        # set per call (long prefill): no refresh on hits, and the experts installed for a layer move to the LRU's cold
+        # end once that layer's call is done (installing them there directly would make every eviction scan past them)
+        self.cold = False
+        self.cold_installed = {}
         self.prefetched = self.prefetch_used = self.installed_ahead = 0
         self.kernel = load_kernel()
         # GGUF_EXPERTS_PROFILE=1: host seconds per phase of the experts forward, in stats()
@@ -203,7 +213,8 @@ class GgufExpertStore:
         slot = size_class.cache.get(key)
         if slot is not None:
             self.hits += 1
-            size_class.cache.move_to_end(key)
+            if not self.cold:
+                size_class.cache.move_to_end(key)
             return slot
         self.misses += 1
         return self._install(prefix, expert, pinned)
@@ -241,8 +252,17 @@ class GgufExpertStore:
         size_class.gate_up[slot].view(-1).copy_(buffer[:split], non_blocking=True)
         size_class.down[slot].view(-1).copy_(buffer[split:], non_blocking=True)
         size_class.cache[key] = slot
+        if self.cold:
+            self.cold_installed.setdefault(prefix, []).append(key)
         self.slot_tables[prefix][expert] = slot
         return slot
+
+    def demote(self, prefix):
+        """Move the experts installed for ``prefix`` by cold calls to the cold end of their LRU."""
+        cache = self.class_of[prefix].cache
+        for key in self.cold_installed.pop(prefix, ()):
+            if key in cache:
+                cache.move_to_end(key, last=False)
 
     def expert_blocks(self, prefix, expert):
         """``(gate_up, down)`` blocks of one expert on the device: pool views when cached, else read for one use."""
@@ -461,6 +481,7 @@ def gguf_experts_forward(module, hidden_states, top_k_index, top_k_weights):
     if readahead_next:
         store.prefetch(module.offload_next_prefix, range(store.num_experts))
     size_class = store.class_of[prefix]
+    store.cold = COLD_PREFILL_TOKENS > 0 and top_k_index.shape[0] >= COLD_PREFILL_TOKENS
     try:
         pinned = set()
         for position, expert in enumerate(experts):
@@ -478,6 +499,7 @@ def gguf_experts_forward(module, hidden_states, top_k_index, top_k_weights):
             result = _grouped_forward(module, store, size_class, hidden_states, top_k_index, top_k_weights, experts)
     finally:
         store.discard(prefix)
+        store.demote(prefix)
     if store.commit:
         _commit_mps(store)
     if readahead_next and PREFILL_INSTALL_AHEAD:

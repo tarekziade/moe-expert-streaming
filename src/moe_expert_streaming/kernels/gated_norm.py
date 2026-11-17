@@ -2,7 +2,8 @@
 
 The reference runs ~8 PyTorch ops over the ``(tokens * value_heads, head_dim)`` output (9 ms for 2,048 tokens of
 Qwen3.8-Flash-Next on an M5); here one SIMD group normalizes one row, with the reference's roundings: the normalized row
-is rounded to the input dtype, multiplied by the weight in that dtype, then by ``silu(gate)`` in float32 and rounded.
+is rounded to the input dtype, multiplied by the weight in that dtype, then by ``silu(gate)`` or ``sigmoid(gate)`` (Qwen3.8) in float32
+and rounded.
 """
 
 import functools
@@ -20,7 +21,7 @@ kernel void gated_rms_norm(
     device const T* gate [[buffer(1)]],
     device const T* weight [[buffer(2)]],
     device T* out [[buffer(3)]],
-    device const float* params [[buffer(4)]],  // rows, width, eps
+    device const float* params [[buffer(4)]],  // rows, width, eps, activation (0 silu, 1 sigmoid)
     uint row [[threadgroup_position_in_grid]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -35,11 +36,12 @@ kernel void gated_rms_norm(
     sum += v * v;
   }
   const float scale = rsqrt(simd_sum(sum) / float(width) + params[2]);
+  const bool sigmoid = params[3] != 0.0f;
   for (uint i = lane; i < width; i += 32) {
     const T normed = T(float(x[base + i]) * scale);
     const T weighted = T(float(weight[i]) * float(normed));
     const float z = float(gate[base + i]);
-    out[base + i] = T(float(weighted) * (z / (1.0f + exp(-z))));
+    out[base + i] = T(float(weighted) * (sigmoid ? 1.0f / (1.0f + exp(-z)) : z / (1.0f + exp(-z))));
   }
 }
 
@@ -52,6 +54,7 @@ template [[host_name("gated_rms_norm_half")]] kernel void gated_rms_norm<half>(
 """
 
 _SUFFIX = {torch.bfloat16: "bfloat", torch.float16: "half"}
+_ACTIVATIONS = {"silu": 0.0, "swish": 0.0, "sigmoid": 1.0}
 ROWS_PER_GROUP = 8
 
 
@@ -61,8 +64,8 @@ def _library():
 
 
 @functools.cache
-def _params(rows, width, eps, device):
-    return torch.tensor([rows, width, eps], dtype=torch.float32, device=device)
+def _params(rows, width, eps, activation, device):
+    return torch.tensor([rows, width, eps, _ACTIVATIONS[activation]], dtype=torch.float32, device=device)
 
 
 def supports(module, hidden_states, gate):
@@ -71,7 +74,7 @@ def supports(module, hidden_states, gate):
         and hidden_states.dtype in _SUFFIX
         and gate.dtype == hidden_states.dtype
         and module.weight.dtype == hidden_states.dtype
-        and getattr(module, "activation", "silu") == "silu"
+        and getattr(module, "activation", "silu") in _ACTIVATIONS
         and gate.shape == hidden_states.shape
         and not torch.is_grad_enabled()
     )
@@ -87,7 +90,7 @@ def gated_rms_norm(module, hidden_states, gate):
         gate.contiguous(),
         module.weight,
         out,
-        _params(rows, width, module.variance_epsilon, x.device),
+        _params(rows, width, module.variance_epsilon, getattr(module, "activation", "silu"), x.device),
         threads=-(-rows // ROWS_PER_GROUP) * ROWS_PER_GROUP * 32,
         group_size=ROWS_PER_GROUP * 32,
     )

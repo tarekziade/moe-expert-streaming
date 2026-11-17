@@ -35,8 +35,16 @@ def _block_keys(indexer, raw_keys, full_cos, full_sin, first, last, apply_rotary
     ).squeeze(1)
 
 
-def select(indexer, hidden_states, position_embeddings, attention_mask, past_key_values, apply_rotary_pos_emb):
-    """``indexer.forward`` for a batch of one with a plain causal mask, else ``None`` (before any side effect)."""
+def select(
+    indexer, hidden_states, position_embeddings, attention_mask, past_key_values, apply_rotary_pos_emb, blocks_only=False
+):
+    """``indexer.forward`` for a batch of one with a plain causal mask, else ``None`` (before any side effect).
+
+    ``blocks_only`` (one query token past the budget): return ``(selected block indices, tail start)`` instead of the
+    mask: the query attends to the ``compress_ratio`` tokens of each selected block and to every token from the tail
+    start on (the same tokens the mask selects)."""
+    if blocks_only and (hidden_states.shape[1] != 1 or attention_mask.shape[-1] // indexer.compress_ratio == 0):
+        return None
     batch_size, seq_length, _ = hidden_states.shape
     if batch_size != 1:
         return None
@@ -92,6 +100,9 @@ def select(indexer, hidden_states, position_embeddings, attention_mask, past_key
         valid = torch.arange(num_blocks, device=device)[None, :] < blocks_per_query[:, None]
         scores = scores.masked_fill(~valid, float("-inf"))
         top = scores.topk(min(indexer.block_topk, num_blocks), dim=1).indices
+        if blocks_only:
+            indexer._fast_state = (past_key_values, kv_length, block_keys) if past_key_values is not None else None
+            return top[0], num_blocks * ratio
         top_valid = valid.gather(1, top)
         tokens = top[..., None] * ratio + torch.arange(ratio, device=device)
         tokens = torch.where(top_valid[..., None], tokens, kv_length).reshape(seq_length, -1)

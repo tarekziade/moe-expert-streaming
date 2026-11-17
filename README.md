@@ -190,8 +190,11 @@ Prefill chunk size: a prompt chunk routes to nearly every expert of every layer,
 slower and a single 4K chunk swaps. On top of that, `experts_offload` reads the next layer's experts during prefill
 (`prefill_readahead_routes`, #50717): 103–106 tok/s. Past 2,048 keys the QSA indexer's token selection (a Python loop with a
 host sync per query in the model) runs vectorized for causal masks (`indexer.py`, same masks): 108–110 -> 158–160 tok/s;
-`MOE_STREAMING_FAST_INDEXER=0` to compare. The Gated DeltaNet prefill runs on `ggml-org/ggml-gated-delta-net`
-(+2.6%; `MOE_STREAMING_GGML_GDN_PREFILL=0` to compare).
+`MOE_STREAMING_FAST_INDEXER=0` to compare. The Gated DeltaNet prefill runs on our conv / q-k prep / scan kernels
+(`MOE_STREAMING_GDN_SCAN=0` for `ggml-org/ggml-gated-delta-net`, `MOE_STREAMING_GGML_GDN_PREFILL=0` for the PyTorch
+reference). Long-document decode: `--long-doc` (200 tokens after a ~6K-token document); `MOE_STREAMING_QSA_DECODE=0`
+for the model's own masked SDPA past the indexer's budget, `GGUF_EXPERTS_COLD_PREFILL=0` for plain LRU installs in
+prefill. Every switch: [docs/kernels.md](docs/kernels.md).
 
 | Script | What it measures |
 |---|---|
@@ -201,7 +204,7 @@ host sync per query in the model) runs vectorized for causal masks (`indexer.py`
 | `scripts/predict_trace.py`, `scripts/predict_sim.py` | experts inputs + routing per MoE call; next-layer predictors replayed through an LRU cache |
 | `scripts/dense_ablation.py` | dense-layer cost per module category (experts zeroed, replay ablation) |
 | `scripts/decode_profile.py` | host-side time split of the expert path (sync, read waits, bookkeeping) |
-| `scripts/cache_policy_trace.py`, `scripts/cache_policy_sim.py` | routing traces replayed through LRU / LFU / pinning / Belady |
+| `scripts/cache_policy_trace.py`, `scripts/cache_policy_sim.py` | routing traces replayed through LRU / LFU / pinning / Belady (3-bit experts; the GGUF-expert replay with per-size pools is in the Space's `results/qwen38_local_m5/2026-11-17-long-doc-decode/`) |
 | `repro/mps_commit.py` | PyTorch MPS keeps small kernels uncommitted until the next sync |
 | `repro/quantized_matmul_bf16.py` | M5 bf16 bug in the v2 dense quantized matmul (kernels-community#1332) |
 

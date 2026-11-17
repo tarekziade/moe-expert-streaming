@@ -8,9 +8,9 @@ Results, architecture and analysis: <https://huggingface.co/spaces/tarekziade/mo
 
 | Qwen3.8-Flash-Next, M5 32 GB | |
 |---|---|
-| Decode | **~13.7 tok/s** with GGUF experts and dense layers (median of 4 different 200-token answers, cold cache first); ~11.6 with 3-bit experts |
-| Prefill, 4K-token prompt | **~219 tok/s** with GGUF experts (Strata: 220), ~158 with 3-bit experts (2K chunks, next-layer read-ahead from #50717 at `18abece3ab`, vectorized indexer) |
-| After a 6K-token document | GGUF experts: prefill ~192 tok/s, decode **~11.4 tok/s** (Strata: 222 / 13.7); 3-bit experts: ~158 / ~8.7 (12 GiB cache) |
+| Decode | **~13.9 tok/s** with GGUF experts and dense layers (median of 4 different 200-token answers, cold cache first); ~11.6 with 3-bit experts |
+| Prefill, 4K-token prompt | **~228 tok/s** with GGUF experts (Strata: 220), ~158 with 3-bit experts (2K chunks, next-layer read-ahead from #50717, vectorized indexer) |
+| After a 6K-token document | GGUF experts: prefill ~206 tok/s, decode **~12.4 tok/s** (Strata: 222 / 13.7); 3-bit experts: ~158 / ~8.7 (12 GiB cache) |
 | Device memory after load | ~18 GiB with a 12 GiB expert cache |
 | Experts | Strata's GGUF experts (IQ2/IQ3 gate/up, IQ4_NL/Q2_0 down; 1.75 MB mean, 43 GB) or our 3-bit (2.15 MB, 49 GB); dense layers GGUF or 8-bit (see below) |
 

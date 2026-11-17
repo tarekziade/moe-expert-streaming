@@ -8,9 +8,9 @@ Results, architecture and analysis: <https://huggingface.co/spaces/tarekziade/mo
 
 | Qwen3.8-Flash-Next, M5 32 GB | |
 |---|---|
-| Decode | **~13.3 tok/s** with GGUF experts and dense layers (median of 4 different 200-token answers, cold cache first); ~11.6 with 3-bit experts |
-| Prefill, 4K-token prompt | **~190 tok/s** with GGUF experts, ~158 with 3-bit experts (2K chunks, next-layer read-ahead from #50717 at `18abece3ab`, vectorized indexer) |
-| After a 6K-token document | GGUF experts: prefill ~179 tok/s, decode ~9.8 tok/s; 3-bit experts: ~158 / ~8.7 (12 GiB cache) |
+| Decode | **~13.5 tok/s** with GGUF experts and dense layers (median of 4 different 200-token answers, cold cache first); ~11.6 with 3-bit experts |
+| Prefill, 4K-token prompt | **~219 tok/s** with GGUF experts (Strata: 220), ~158 with 3-bit experts (2K chunks, next-layer read-ahead from #50717 at `18abece3ab`, vectorized indexer) |
+| After a 6K-token document | GGUF experts: prefill ~186 tok/s, decode ~9.5 tok/s; 3-bit experts: ~158 / ~8.7 (12 GiB cache) |
 | Device memory after load | ~18 GiB with a 12 GiB expert cache |
 | Experts | Strata's GGUF experts (IQ2/IQ3 gate/up, IQ4_NL/Q2_0 down; 1.75 MB mean, 43 GB) or our 3-bit (2.15 MB, 49 GB); dense layers GGUF or 8-bit (see below) |
 
@@ -116,14 +116,27 @@ model = load_qwen38("/path/to/qwen38", cache_gib=12, dense_bits=8, gguf_dense="/
 Prefill kernels on top (alternating runs, GGUF experts, previous version vs now): 16-row tiles for each expert's last
 routes, the next layer's finished reads installed behind this layer's compute, the hyper-connection norm / act / mix
 kernels for any number of tokens (the fused down projection stays single-token: MLX bf16 `quantized_matmul` is wrong for
-many rows on M5, kernels-community#1332), and the Gated DeltaNet output norm (`RMSNormGated`) as one kernel
-(9.35 -> 0.61 ms per 2K-token layer).
+many rows on M5, kernels-community#1332). (A Gated DeltaNet output norm kernel was in that version but only accepted a
+SiLU gate; Qwen3.8's is a sigmoid, so it never ran.)
 
 | M5 32 GB, GGUF experts | Before | Now |
 |---|---|---|
 | Decode, median of 4 prompts | 12.97 / 12.92 tok/s | **13.40 / 13.19 tok/s** |
 | 4K prefill | 172.3 / 167.2 tok/s | **189.4 / 190.7 tok/s** |
 | After a 6K document: prefill / decode | 157.2 / 9.92, 160.0 / 9.93, 154.0 / 9.87 | **179.8 / 9.95, 178.0 / 9.70** |
+
+Then the Gated DeltaNet prefill, 67 -> 28 ms per 2K-token layer: the output norm kernel with the sigmoid gate
+(9.3 -> 0.6 ms); our own delta-rule scan after Strata's `gdn_scan_r` (a lane per state column, the state in registers;
+32.8 ms for ggml's kernel -> 11.4 ms with PyTorch prep); the causal conv + SiLU as one kernel writing token-major rows
+(bit-exact, 3.1 -> 1.0 ms) and a q/k L2 norm kernel reading those rows. Prefill-path perplexity moves within the
+spread of the implementations (4.9841; the PyTorch path on the same build 4.9964, ggml's delta rule 4.9761). See
+[docs/kernels.md](docs/kernels.md) for every kernel.
+
+| M5 32 GB, GGUF experts | Before | Now |
+|---|---|---|
+| Decode, median of 4 prompts | 13.07 / 13.50 tok/s | **13.40 / 13.63 tok/s** |
+| 4K prefill | 193.1 / 192.4 tok/s | **212.2 / 225.6 tok/s** |
+| After a 6K document: prefill / decode | 171.8 / 9.80, 166.0 / 9.51, 168.5 / 9.52 | **183.2 / 9.47, 194.5 / 9.39, 181.0 / 9.63** |
 
 The experts are read through the OS page cache like the 3-bit ones (`bypass_page_cache=False`); with `F_NOCACHE` the
 decode gain was only +2–5%.

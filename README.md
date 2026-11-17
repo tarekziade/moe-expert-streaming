@@ -29,6 +29,8 @@ The generic part lives in Transformers itself; this project adds what is not (ye
 
 Patches are applied at the class level by `moe_expert_streaming.apply()`; nothing in Transformers is edited.
 
+Which kernels run where, and which weights come from safetensors or from the GGUF: [docs/kernels.md](docs/kernels.md).
+
 ## Install
 
 Apple silicon, Python ≥ 3.10:

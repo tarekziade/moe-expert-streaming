@@ -8,9 +8,9 @@ Results, architecture and analysis: <https://huggingface.co/spaces/tarekziade/mo
 
 | Qwen3.8-Flash-Next, M5 32 GB | |
 |---|---|
-| Decode | **~13.5 tok/s** with GGUF experts and dense layers (median of 4 different 200-token answers, cold cache first); ~11.6 with 3-bit experts |
+| Decode | **~13.7 tok/s** with GGUF experts and dense layers (median of 4 different 200-token answers, cold cache first); ~11.6 with 3-bit experts |
 | Prefill, 4K-token prompt | **~219 tok/s** with GGUF experts (Strata: 220), ~158 with 3-bit experts (2K chunks, next-layer read-ahead from #50717 at `18abece3ab`, vectorized indexer) |
-| After a 6K-token document | GGUF experts: prefill ~186 tok/s, decode ~9.5 tok/s; 3-bit experts: ~158 / ~8.7 (12 GiB cache) |
+| After a 6K-token document | GGUF experts: prefill ~192 tok/s, decode **~11.4 tok/s** (Strata: 222 / 13.7); 3-bit experts: ~158 / ~8.7 (12 GiB cache) |
 | Device memory after load | ~18 GiB with a 12 GiB expert cache |
 | Experts | Strata's GGUF experts (IQ2/IQ3 gate/up, IQ4_NL/Q2_0 down; 1.75 MB mean, 43 GB) or our 3-bit (2.15 MB, 49 GB); dense layers GGUF or 8-bit (see below) |
 
@@ -137,6 +137,25 @@ spread of the implementations (4.9841; the PyTorch path on the same build 4.9964
 | Decode, median of 4 prompts | 13.07 / 13.50 tok/s | **13.40 / 13.63 tok/s** |
 | 4K prefill | 193.1 / 192.4 tok/s | **212.2 / 225.6 tok/s** |
 | After a 6K document: prefill / decode | 171.8 / 9.80, 166.0 / 9.51, 168.5 / 9.52 | **183.2 / 9.47, 194.5 / 9.39, 181.0 / 9.63** |
+
+Then decode after a long document (113 ms per token after the 6K document vs 80 after a short prompt; the gap was the
+attention past the indexer's 2,048-token budget, +18 ms, and expert misses, +30 ms):
+- attention reads only the indexer's selected blocks and the tail (split-K flash decoding kernel) instead of SDPA over
+  the whole cache with a boolean mask: 0.95 -> 0.12 ms per layer at 6K keys, closer to a float32 reference than the bf16
+  SDPA (relative error 1.6e-3 vs 2.3e-3);
+- the indexer's decode step (query norm + rotary, block scores) as two kernels: 0.47 -> 0.11 ms per layer, same blocks;
+- long prefill calls (>= 512 tokens) leave their expert installs at the LRU's cold end: a 2K chunk cycles through nearly
+  every expert of a layer, more than its pool holds, so plain LRU evicts each expert just before the next chunk needs
+  it. A replay of the routing trace: 6K prefill misses -28%, decode misses after it -8%. A Strata-like static cache
+  ranked by decode frequency replayed far worse (205 misses per token after the document vs 67 for LRU): routing
+  has strong short-term locality. Measured: -7% misses, decode +0.6%.
+
+| M5 32 GB, GGUF experts | Before | Now |
+|---|---|---|
+| After a 6K document: prefill / decode | 205.0 / 9.82, 193.4 / 9.73 | **197.5 / 11.56, 186.6 / 11.25** |
+| Decode, median of 4 prompts | 13.86 / 13.41 tok/s | 13.81 / 13.80 tok/s |
+
+The 200-token answer after the document now diverges from the previous build after ~40 tokens (both coherent).
 
 The experts are read through the OS page cache like the 3-bit ones (`bypass_page_cache=False`); with `F_NOCACHE` the
 decode gain was only +2–5%.

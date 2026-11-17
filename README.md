@@ -20,7 +20,7 @@ The generic part lives in Transformers itself; this project adds what is not (ye
 
 | Piece | Where |
 |---|---|
-| `from_pretrained(..., experts_offload={...})`: expert cache (one pool per expert layout), SSD reads, read-ahead, cold prefill installs, quantized experts, external expert sources, early MPS commits | [huggingface/transformers#50717](https://github.com/huggingface/transformers/pull/50717) |
+| `from_pretrained(..., device_map={"": "mps", "experts.*": "disk"}, experts_offload={...})`: expert cache (one pool per expert layout), SSD reads, read-ahead, cold prefill installs, quantized experts, external expert sources, routing-profile warm start, early MPS commits | [huggingface/transformers#50717](https://github.com/huggingface/transformers/pull/50717) |
 | `MetalConfig` dense layers on the v2 MLX kernels (`quantized_matmul`), MLX-exact quantization, ggml layer kernels | [huggingface/transformers#49467](https://github.com/huggingface/transformers/pull/49467), carried in `metal_linear.py` until merged |
 | Qwen3.8: the 51 GB n-gram table read from disk, Metal decode kernels (Gated DeltaNet, hyper-connections), QSA indexer shortcut and vectorized selection | this package (`qwen38.py`, `kernels/`) |
 | Dense layers from a GGUF file on ggml's kernels (`ggml-org/ggml-quantization`) | this package (`gguf_dense.py`) |

@@ -90,6 +90,26 @@ def _patch(cls, name, make):
     setattr(cls, name, patched)
 
 
+def _append(layer, name, current, new, dim):
+    """``torch.cat([current, new], dim)`` as a view of ``layer.<name>``, a buffer grown in steps (copied only then).
+    Starts over from ``current`` when something else replaced it (crop, reorder, offload)."""
+    buffer, view = getattr(layer, name, (None, None))
+    length = current.shape[dim] if current.numel() else 0
+    needed = length + new.shape[dim]
+    if buffer is None or view is not current or buffer.shape[dim] < needed or buffer.device != new.device:
+        capacity = max(needed + 1024, int(needed * 1.25)) // 256 * 256 + 256
+        shape = list(new.shape)
+        shape[dim] = capacity
+        grown = torch.empty(shape, dtype=new.dtype, device=new.device)
+        if length:
+            grown.narrow(dim, 0, length).copy_(current)
+        buffer = grown
+    buffer.narrow(dim, length, new.shape[dim]).copy_(new)
+    view = buffer.narrow(dim, 0, needed)
+    setattr(layer, name, (buffer, view))
+    return view
+
+
 def apply():
     """Install the Qwen3.8 patches and the Metal dense-layer patches (idempotent)."""
     from transformers.integrations import experts_offload
@@ -243,6 +263,34 @@ def apply():
         return forward
 
     _patch(m.Qwen4ExpTextAttention, "forward", attention_forward)
+
+    # The full-attention layers' caches grow by torch.cat, which copies the whole cache at every decode step (1.5 ms
+    # per token at 6K tokens over the 12 layers). Keep them as views of buffers grown in steps; appends write in place.
+    from transformers.cache_utils import DynamicIndexedLayer
+
+    def layer_update(original):
+        def update(self, key_states, value_states, *args, **kwargs):
+            if not self.is_initialized:
+                self.lazy_initialization(key_states, value_states)
+            self.keys, self.values = (
+                _append(self, "_key_buffer", self.keys, key_states, -2),
+                _append(self, "_value_buffer", self.values, value_states, -2),
+            )
+            return self.keys, self.values
+
+        return update
+
+    def indexer_update(original):
+        def update_indexer(self, indexer_key_states):
+            if not self.is_indexer_initialized:
+                self.lazy_initialization_indexer(indexer_key_states)
+            self.indexer_keys = _append(self, "_indexer_buffer", self.indexer_keys, indexer_key_states, 1)
+            return self.indexer_keys
+
+        return update_indexer
+
+    _patch(DynamicIndexedLayer, "update", layer_update)
+    _patch(DynamicIndexedLayer, "update_indexer", indexer_update)
 
 
 def load_qwen38(

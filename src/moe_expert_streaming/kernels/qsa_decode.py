@@ -188,16 +188,32 @@ def supports(query, key):
     )
 
 
+def _rows(cache):
+    """``cache`` [1, KVH, L, D] as a buffer the kernel can read (rows of D, a head stride): a view of the first L rows of
+    a larger buffer (the grown cache) is passed as that buffer, without a copy."""
+    if cache.is_contiguous():
+        return cache, cache.shape[2] * cache.shape[3]
+    base = cache._base
+    if (
+        base is not None and base.is_contiguous() and cache.storage_offset() == 0 and base.dim() == 4
+        and cache.stride(3) == 1 and cache.stride(2) == cache.shape[3] and base.stride(1) == cache.stride(1)
+    ):
+        return base, cache.stride(1)
+    return cache.contiguous(), cache.shape[2] * cache.shape[3]
+
+
 def attention(query, key, value, blocks, ratio, tail_start, scaling):
     """``query`` [1, H, 1, D], ``key``/``value`` [1, KVH, L, D] (the cache), ``blocks`` [nb] int64 selected block indices
     (``ratio`` tokens each), plus every token from ``tail_start`` to ``L - 1``. Returns [1, H, 1, D] in the query dtype."""
     _, heads, _, dim = query.shape
     kv_heads, length = key.shape[1], key.shape[2]
-    key, value = key.contiguous(), value.contiguous()
+    (key, head_stride), (value, value_stride) = _rows(key), _rows(value)
+    if head_stride != value_stride:
+        key, value, head_stride = key.contiguous(), value.contiguous(), length * dim
     blocks = blocks.contiguous()
     selected = blocks.numel() * ratio + (length - tail_start)
     splits = max(1, -(-selected // TOKENS_PER_GROUP))
-    dims = _dims((heads, kv_heads, blocks.numel(), ratio, tail_start, length * dim, selected, splits), query.device)
+    dims = _dims((heads, kv_heads, blocks.numel(), ratio, tail_start, head_stride, selected, splits), query.device)
     partial = torch.empty(heads * splits * (2 + dim), dtype=torch.float32, device=query.device)
     out = torch.empty(heads, dim, dtype=query.dtype, device=query.device)
     lib, name = _library(), f"{_SUFFIX[query.dtype]}_{dim}"

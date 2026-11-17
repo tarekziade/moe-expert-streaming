@@ -48,6 +48,7 @@ on 8-bit `MetalConfig` dense layers and 3-bit MLX experts.
 | `kernels/q2_0.py` | `q2_0_mul_mat_id_*` (gather-gemv), `q2_0_dequantize_*` | the Q2_0 expert down projections (30 of 48 layers), which ggml's Metal gemv lacks | `gguf_experts` |
 | `kernels/gated_delta_net.py` | `gdn_conv_gates_*` (conv state + conv + SiLU + gates), `gdn_delta_norm_*` (delta rule + gated RMSNorm) | one Gated DeltaNet decode step (~34 ops); its four input projections become one matmul | MPS, 1 token with a cache |
 | `kernels/gdn_scan.py` (scan after Strata's `gdn_scan_r`, MIT) | `gdn_conv_silu_*` (causal conv + SiLU, token-major output), `gdn_prep_qk_*` (q/k L2 norm, scale, k.q), `gdn_scan_4_16_*` (the gated delta rule, a lane per state column) | the PyTorch `causal_conv1d_fn` and `torch_chunk_gated_delta_rule` (via `kernels/gdn_prefill.py`) | MPS prefill; `MOE_STREAMING_GGML_GDN_PREFILL=0` turns all of it off |
+| `kernels/qsa_decode.py` | `qsa_decode_partial_*` + `qsa_decode_merge_*` (split-K flash decoding over the indexer's selected blocks and the tail only), `qsa_index_q_*` (indexer query RMSNorm + rotary), `qsa_index_scores_*` (block scores; `torch.topk` picks the blocks) | the decode step of `Qwen4ExpTextAttention` past `indexer_budget` keys: the boolean mask over the whole cache, SDPA over every key, and the indexer's ~35 small ops (`indexer.select(..., blocks_only=True)`) | MPS, one token, more keys than the budget |
 | `kernels/gated_norm.py` | `gated_rms_norm_*` | `Qwen4ExpTextRMSNormGated` (Gated DeltaNet output norm, silu or sigmoid gate) | MPS, any number of tokens |
 | `kernels/hyper_connection.py` | `hc_norm_*`, `hc_act_*`, `hc_mix_*` | `Qwen4ExpTextGatedResidual` (~25 small ops); its projections keep their own matmuls | MPS, any number of tokens |
 | `kernels/triton_gather_qmv.py` (Triton) | `gather_qmv` | 3-bit expert decode on CUDA | CUDA |
@@ -63,6 +64,8 @@ Attention itself is PyTorch SDPA (`attn_implementation="sdpa"`: the indexer's sp
 |---|---|
 | `MOE_STREAMING_GGML_GDN_PREFILL=0` | Gated DeltaNet prefill on the PyTorch reference (conv and chunked delta rule) |
 | `MOE_STREAMING_FAST_INDEXER=0` | the model's own per-query QSA indexer selection |
+| `MOE_STREAMING_QSA_DECODE=0` | decode attention past the budget on the model's mask + SDPA (and the indexer's own ops) |
+| `GGUF_EXPERTS_COLD_PREFILL` | calls with at least this many tokens (default 512) leave their installs at the LRU's cold end and do not refresh hits; 0 turns it off |
 | `MOE_STREAMING_GDN_SCAN=0` | Gated DeltaNet prefill on `ggml-org/ggml-gated-delta-net` instead of `gdn_scan` |
 | `GGUF_EXPERTS_TILE_ROWS`, `GGUF_EXPERTS_TAIL_ROWS`, `GGUF_EXPERTS_INSTALL_AHEAD` | GGUF expert prefill tiling (32 / 16 / 1) |
 | `GGUF_EXPERTS_PROFILE=1` | host clocks of the GGUF expert prefill in the store stats |

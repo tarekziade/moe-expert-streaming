@@ -300,7 +300,7 @@ def load_qwen38(
         model = Qwen4ExpForCausalLM.from_pretrained(
             converted / "dense",
             dtype=torch.bfloat16,
-            device_map=device,
+            device_map={"": device, "experts.*": "disk"},  # experts stream through experts_offload
             attn_implementation="sdpa",  # the indexer's sparse mask rules out the flash kernels
             quantization_config=(
                 MetalConfig(bits=dense_bits, group_size=64, modules_to_not_convert=["shared_expert_gate"])

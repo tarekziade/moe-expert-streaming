@@ -66,7 +66,7 @@ def wrap(original, l2norm):
         query, key = query.float(), key.float()
         if use_qk_l2norm_in_kernel:
             query, key = l2norm(query, dim=-1, eps=1e-6), l2norm(key, dim=-1, eps=1e-6)
-        if head_dim == gdn_scan.HEAD_DIM and v_heads % k_heads == 0:
+        if head_dim == gdn_scan.HEAD_DIM and v_heads % k_heads == 0 and os.environ.get("MOE_STREAMING_GDN_SCAN", "1") == "1":
             # Our scan kernel (3x ggml's at 2K tokens on an M5): same (key, value) state layout as the reference.
             if initial_state is None:
                 state = torch.zeros(batch, v_heads, head_dim, head_dim, dtype=torch.float32, device=query.device)

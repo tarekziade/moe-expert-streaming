@@ -1,0 +1,92 @@
+[
+  {
+    "dependency": {
+      "repo-id": "ggml-org/ggml-gated-delta-net",
+      "version": 1
+    },
+    "lock": {
+      "commit": "8df6685626a7e966145bc80de6b7820eac2f6d37"
+    }
+  },
+  {
+    "dependency": {
+      "repo-id": "ggml-org/ggml-quantization",
+      "version": 1
+    },
+    "lock": {
+      "commit": "acb903647587a55e0af26c785fbf73f6af15f921"
+    }
+  },
+  {
+    "dependency": {
+      "repo-id": "kernels-community/mlx-quantization-metal-kernels",
+      "version": 2
+    },
+    "lock": {
+      "commit": "2480c3e225c385d9e43943c0c7e7a5a84358b336"
+    }
+  },
+  {
+    "dependency": {
+      "repo-id": "tarekziade/gated-delta-net-decode-metal",
+      "version": 1
+    },
+    "lock": {
+      "commit": "c79b784f6f5a6d0bac90a761548c3957b8b4ba65"
+    }
+  },
+  {
+    "dependency": {
+      "repo-id": "tarekziade/gated-rms-norm-metal",
+      "version": 1
+    },
+    "lock": {
+      "commit": "5bfd2a00cdce60f5c9492b85176ac2002928ef52"
+    }
+  },
+  {
+    "dependency": {
+      "repo-id": "tarekziade/gdn-scan-metal",
+      "version": 1
+    },
+    "lock": {
+      "commit": "69cd6b5169bf92bc24c88ce24d481148ee23d650"
+    }
+  },
+  {
+    "dependency": {
+      "repo-id": "tarekziade/gguf-mm-metal",
+      "version": 1
+    },
+    "lock": {
+      "commit": "2e45e68acecdb2596d4226c997ce8cd7eb8ecfdb"
+    }
+  },
+  {
+    "dependency": {
+      "repo-id": "tarekziade/hyper-connection-metal",
+      "version": 1
+    },
+    "lock": {
+      "commit": "b90b11201e984a6024c61dfd69c5582e1338a47f"
+    }
+  },
+  {
+    "dependency": {
+      "repo-id": "tarekziade/q2-0-metal",
+      "version": 1
+    },
+    "lock": {
+      "commit": "00c2006cab29dabc948d91391382ecee66b68a17"
+    }
+  },
+  {
+    "dependency": {
+      "repo-id": "tarekziade/qsa-decode-metal",
+      "version": 1
+    },
+    "lock": {
+      "commit": "5376f1c153b4525cb2f6e6a55e5daee0165d5197"
+    }
+  }
+]

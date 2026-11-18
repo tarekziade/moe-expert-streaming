@@ -3,8 +3,8 @@
 What runs where when Qwen3.8-Flash-Next is loaded with `load_qwen38` (`src/moe_expert_streaming/qwen38.py`), and which
 weights come from the converted safetensors checkpoint and which from Strata's GGUF.
 
-Everything here is pure Python on the host side: device work is either a [Hub kernel](https://huggingface.co/docs/kernels)
-(`kernels.get_kernel`) or Metal source in this package compiled at first use with `torch.mps.compile_shader`. The
+Everything here is pure Python on the host side: device work is [Hub kernels](https://huggingface.co/docs/kernels),
+including this package's own Metal kernels (Metal source compiled at first use with `torch.mps.compile_shader`). The
 patches are installed by `qwen38.apply()` (idempotent, called by `load_qwen38`); each one falls back to the model's own
 code when its conditions do not hold (another device, another dtype, grad enabled, an unexpected shape).
 
@@ -30,6 +30,11 @@ on 8-bit `MetalConfig` dense layers and 3-bit MLX experts.
 
 ## Hub kernels
 
+Every Hub kernel the package loads is declared in `pyproject.toml` (`[tool.kernels.dependencies]`) and pinned to a commit
+in `kernels.lock`; `hub_kernels.get_locked` loads that commit. After a republish or to pick up a new upstream build,
+re-lock with `python tools/lock_kernels.py` (`kernels lock .` refuses our user-namespace repositories) and commit the
+lock. For offline runs (`HF_HUB_OFFLINE=1`), fetch the pinned builds once with `kernels download .`.
+
 | Kernel | Used for | When |
 |---|---|---|
 | `kernels-community/mlx-quantization-metal-kernels` v2: `quantized_matmul` | 8-bit `MetalConfig` dense layers (`metal_linear.py`); the hyper-connection's fused down + inject projection for one token | MPS, `dense_bits` set. The fused projection is single-token only: bf16 `quantized_matmul` is wrong on M5 for many rows (kernels-community#1332) |
@@ -42,9 +47,11 @@ on 8-bit `MetalConfig` dense layers and 3-bit MLX experts.
 
 ## This package's Metal kernels
 
-The Metal modules are published on the Kernel Hub, one repository each (`tools/publish_hub_kernels.py`), and the
-package loads them from there on MPS (`hub_kernels.py`: `get_kernel(repo, version=1)`, at first use). `kernels/` stays
-the source: it is what gets published, and what runs off MPS or with `MOE_STREAMING_LOCAL_KERNELS=1`.
+The Metal modules are published on the Kernel Hub, one repository each under `tarekziade/` (listed with what each does
+on the [Space](https://tarekziade-moe-expert-streaming.static.hf.space/details.html#published-kernels)),
+and the package loads them from there on MPS (`hub_kernels.py`, the locked commit, at first use). `kernels/` stays the
+source: it is what gets published, and what runs off MPS or with `MOE_STREAMING_LOCAL_KERNELS=1`. To publish a change:
+`python tools/publish_hub_kernels.py` (uploads to `main` and `v1`, then `--verify`), then re-lock.
 
 | Module | Hub | Kernels | Replaces | When |
 |---|---|---|---|---|

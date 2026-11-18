@@ -17,9 +17,9 @@ from ..hub_kernels import gdn_scan
 
 @functools.cache
 def load_kernel():
-    from kernels import get_kernel
+    from ..hub_kernels import get_locked
 
-    return get_kernel("ggml-org/ggml-gated-delta-net", version=1)
+    return get_locked("ggml-org/ggml-gated-delta-net")
 
 
 def enabled():

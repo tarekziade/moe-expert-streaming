@@ -15,14 +15,14 @@ import functools
 import torch
 
 
-KERNEL_REPO, KERNEL_VERSION = "kernels-community/mlx-quantization-metal-kernels", 2
+KERNEL_REPO = "kernels-community/mlx-quantization-metal-kernels"
 
 
 @functools.cache
 def load_metal_kernel():
-    from kernels import get_kernel
+    from .hub_kernels import get_locked
 
-    return get_kernel(KERNEL_REPO, version=KERNEL_VERSION)
+    return get_locked(KERNEL_REPO)
 
 
 def _metal_linear_forward(self, input):

@@ -28,6 +28,22 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["src/moe_expert_streaming"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"kernels.lock" = "moe_expert_streaming/kernels.lock"
+
+# Hub kernels, pinned to commits in kernels.lock (`kernels lock .`; `kernels download .` fetches them for offline runs).
+[tool.kernels.dependencies]
+"tarekziade/gguf-mm-metal" = 1
+"tarekziade/q2-0-metal" = 1
+"tarekziade/gated-delta-net-decode-metal" = 1
+"tarekziade/gdn-scan-metal" = 1
+"tarekziade/qsa-decode-metal" = 1
+"tarekziade/gated-rms-norm-metal" = 1
+"tarekziade/hyper-connection-metal" = 1
+"ggml-org/ggml-quantization" = 1
+"ggml-org/ggml-gated-delta-net" = 1
+"kernels-community/mlx-quantization-metal-kernels" = 2
+
 [tool.ruff]
 line-length = 119
 target-version = "py310"

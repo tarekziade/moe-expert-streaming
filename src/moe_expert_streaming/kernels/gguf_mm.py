@@ -55,8 +55,13 @@ def mm_tiles(bank, ggml_type, x, tiles, out=None, kernel="mpp"):
     count = tiles.shape[0] * (n // 64)
     if count:
         getattr(_library(), f"gguf_mm_{kernel}_{NAMES[ggml_type]}")(
-            bank, x.float().contiguous(), tiles, out, _params(n, x.shape[1], row_bytes, x.device),
-            threads=count * 128, group_size=128,
+            bank,
+            x.float().contiguous(),
+            tiles,
+            out,
+            _params(n, x.shape[1], row_bytes, x.device),
+            threads=count * 128,
+            group_size=128,
         )
     return out
 
@@ -75,8 +80,14 @@ def mm_rows(bank, ggml_type, x, rows, tiles, tile_rows, out=None):
     count = tiles.shape[0] * (n // 64)
     if count:
         getattr(_library(), f"gguf_mm_mpp2_{NAMES[ggml_type]}_{_SUFFIX[x.dtype]}_{tile_rows}")(
-            bank, x.contiguous(), rows, tiles, out, _params(n, x.shape[1], row_bytes, x.device),
-            threads=count * 128, group_size=128,
+            bank,
+            x.contiguous(),
+            rows,
+            tiles,
+            out,
+            _params(n, x.shape[1], row_bytes, x.device),
+            threads=count * 128,
+            group_size=128,
         )
     return out
 
@@ -92,8 +103,12 @@ def combine(routed, pos, weights, dtype):
     hidden = routed.shape[1]
     y = torch.empty(tokens, hidden, dtype=dtype, device=routed.device)
     getattr(_library(), f"gguf_combine_{_SUFFIX[dtype]}")(
-        routed, pos.to(torch.int32).contiguous(), weights.float().contiguous(), y,
-        _combine_params(tokens, hidden, top_k, routed.device), threads=tokens * hidden // 4,
+        routed,
+        pos.to(torch.int32).contiguous(),
+        weights.float().contiguous(),
+        y,
+        _combine_params(tokens, hidden, top_k, routed.device),
+        threads=tokens * hidden // 4,
     )
     return y
 

@@ -412,8 +412,12 @@ def _q8(layer, dtype):
     from transformers.integrations.metal_quantization import MetalLinear
 
     if not (
-        isinstance(layer, MetalLinear) and layer.bits == 8 and layer.group_size == 64 and layer.bias is None
-        and layer.weight.dtype == torch.uint32 and layer.scales.dtype in (torch.float32, dtype)
+        isinstance(layer, MetalLinear)
+        and layer.bits == 8
+        and layer.group_size == 64
+        and layer.bias is None
+        and layer.weight.dtype == torch.uint32
+        and layer.scales.dtype in (torch.float32, dtype)
     ):
         return None
     if layer.scales.dtype == dtype:
@@ -432,7 +436,11 @@ def fused_step_supported(module, hyper_input):
     return (
         os.environ.get("MOE_STREAMING_HC_FUSED", "1") == "1"
         and hyper_input.numel() == count * hidden
-        and count <= 4 and hidden <= 2560 and hidden % 64 == 0 and lowrank <= 512 and lowrank % 64 == 0
+        and count <= 4
+        and hidden <= 2560
+        and hidden % 64 == 0
+        and lowrank <= 512
+        and lowrank % 64 == 0
         and _fused_projections(module) is not None
         and _q8(module.input_mix_weight_up, hyper_input.dtype) is not None
         and _fused_projections(module)[1:3] == (8, 64)
@@ -462,24 +470,53 @@ def fused_step(module, hyper_input):
     if os.environ.get("MOE_STREAMING_HC_FUSED_SPLIT", "1") == "1":
         normed = torch.empty_like(x)
         getattr(library, f"hc_norm_{suffix}")(
-            x, module.hc_norm.weight, normed, _params((float(hidden), module.hc_norm.eps, float(count)), device),
-            threads=count * 256, group_size=256,
+            x,
+            module.hc_norm.weight,
+            normed,
+            _params((float(hidden), module.hc_norm.eps, float(count)), device),
+            threads=count * 256,
+            group_size=256,
         )
         getattr(library, f"hc_down_q8_split_{suffix}")(
             normed, weight, scales, biases, down, injection, params, threads=-(-rows // 2) * 256, group_size=256
         )
         getattr(library, f"hc_up_mix_q8n_{suffix}")(
-            down, normed, up_weight, up_scales, up_biases, mixed, params,
-            threads=-(-hidden // 8) * 256, group_size=256,
+            down,
+            normed,
+            up_weight,
+            up_scales,
+            up_biases,
+            mixed,
+            params,
+            threads=-(-hidden // 8) * 256,
+            group_size=256,
         )
         return mixed, hyper_input, injection
     getattr(library, f"hc_down_q8_{suffix}")(
-        x, module.hc_norm.weight, weight, scales, biases, down, injection, stream_scale, params,
-        threads=-(-rows // 8) * 256, group_size=256,
+        x,
+        module.hc_norm.weight,
+        weight,
+        scales,
+        biases,
+        down,
+        injection,
+        stream_scale,
+        params,
+        threads=-(-rows // 8) * 256,
+        group_size=256,
     )
     getattr(library, f"hc_up_mix_q8_{suffix}")(
-        down, x, module.hc_norm.weight, stream_scale, up_weight, up_scales, up_biases, mixed, params,
-        threads=-(-hidden // 8) * 256, group_size=256,
+        down,
+        x,
+        module.hc_norm.weight,
+        stream_scale,
+        up_weight,
+        up_scales,
+        up_biases,
+        mixed,
+        params,
+        threads=-(-hidden // 8) * 256,
+        group_size=256,
     )
     return mixed, hyper_input, injection
 

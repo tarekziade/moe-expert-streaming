@@ -169,7 +169,11 @@ class _Layer:
         self.gate_up, self.down = pool.banks
         self.num_slots = pool.num_slots
         self.table = store.host_slot_tables[prefix]
-        self.hidden, self.intermediate, self.num_experts = module.hidden_dim, module.intermediate_dim, module.num_experts
+        self.hidden, self.intermediate, self.num_experts = (
+            module.hidden_dim,
+            module.intermediate_dim,
+            module.num_experts,
+        )
 
     def blocks(self, store, prefix, expert):
         """``(gate_up, down)`` blocks of one expert on the device: pool views when cached, else read for one use."""
@@ -181,7 +185,9 @@ def compute(module, store, hidden_states, top_k_index, top_k_weights, routing, e
     prefill paths."""
     layer = module.__dict__.get("_gguf_layer")
     if layer is None:
-        layer = module.__dict__["_gguf_layer"] = _Layer(module, store)  # pool banks exist once the store is materialized
+        layer = module.__dict__["_gguf_layer"] = _Layer(
+            module, store
+        )  # pool banks exist once the store is materialized
     if top_k_index.numel() <= GEMV_MAX_ROUTES and len(pinned) == len(experts):
         return _gemv_forward(module, store, layer, hidden_states, routing, top_k_weights)
     if hidden_states.device.type == "mps":
@@ -195,13 +201,11 @@ def _gemv_forward(module, store, layer, hidden_states, routing, top_k_weights):
     slots = layer.table[routing].to(torch.int32)
     store.inflight.append((slots,))  # read by the non-blocking copy below until the next sync
     slots = slots.to(hidden_states.device, non_blocking=True)
-    gate_up = matmul_routes(
-        layer.gate_up, layer.gate_type, hidden_states, slots, 2 * layer.intermediate
-    )
+    gate_up = matmul_routes(layer.gate_up, layer.gate_type, hidden_states, slots, 2 * layer.intermediate)
     activated = module._apply_gate(gate_up.view(tokens * top_k, -1))
-    down = matmul_routes(
-        layer.down, layer.down_type, activated, slots.view(-1, 1), layer.hidden
-    ).view(tokens, top_k, -1)
+    down = matmul_routes(layer.down, layer.down_type, activated, slots.view(-1, 1), layer.hidden).view(
+        tokens, top_k, -1
+    )
     return (down * top_k_weights[..., None].float()).sum(dim=1).to(hidden_states.dtype)
 
 
@@ -214,9 +218,7 @@ def _grouped_forward(module, store, layer, hidden_states, top_k_index, top_k_wei
     for start in range(0, len(experts), PREFILL_EXPERT_GROUP):
         group = experts[start : start + PREFILL_EXPERT_GROUP]
         blocks = [layer.blocks(store, prefix, expert) for expert in group]
-        gate_up = dequantize(
-            torch.stack([b[0] for b in blocks]), layer.gate_type, layer.hidden, dtype
-        )
+        gate_up = dequantize(torch.stack([b[0] for b in blocks]), layer.gate_type, layer.hidden, dtype)
         down = dequantize(torch.stack([b[1] for b in blocks]), layer.down_type, layer.intermediate, dtype)
         del blocks
         lookup = torch.full((layer.num_experts,), -1, dtype=torch.long, device=device)
@@ -306,6 +308,7 @@ def _tiled_forward_v2(module, store, layer, hidden_states, top_k_index, top_k_we
     snapshot = table.clone()  # the copy below runs later; install_ahead may change `table` before then
     store.inflight.append((snapshot,))
     slots = snapshot.to(device, non_blocking=True).to(torch.int64)
+
     def tile_lists(selected_counts, bank_slots):
         if PREFILL_TAIL_ROWS:
             tiles, tails = gguf_mm.split_tiles(selected_counts, bank_slots, starts, tile_rows, PREFILL_TAIL_ROWS)

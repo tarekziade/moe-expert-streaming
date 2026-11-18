@@ -17,17 +17,17 @@ from pathlib import Path
 
 import torch
 
-from . import indexer, metal_linear, mlx_affine
-from .hub_kernels import gated_delta_net, gated_norm, gdn_scan, hyper_connection, qsa_decode
-from .kernels import gdn_prefill
+from . import indexer, metal_linear, patches
+from .hub_kernels import hyper_connection, qsa_decode
+from .patches import _append, _patch
 
 
 class DiskEmbedding(torch.nn.Module):
     """An embedding table that stays on disk; each lookup reads only the rows it needs (through the OS page cache).
 
     ``directory`` holds ``ngram.json`` (``rows``, ``dim``, ``dtype``: ``float8_e4m3fn``, ``bfloat16`` or ``float32``,
-    ``scale``, ``file``) and the raw row-major file, as ``scripts/convert_fp8.py`` writes them. Rows are dequantized as
-    ``row * scale``.
+    ``scale``, and either ``file`` or ``files`` + ``rows_per_file`` for a table split in row-aligned shards) and the raw
+    row-major file(s), as ``scripts/convert_fp8.py`` writes them. Rows are dequantized as ``row * scale``.
     """
 
     _DTYPES = {"float8_e4m3fn": torch.float8_e4m3fn, "bfloat16": torch.bfloat16, "float32": torch.float32}
@@ -45,7 +45,9 @@ class DiskEmbedding(torch.nn.Module):
         # One descriptor, rows read in parallel: a token's rows are random, and reading them one page fault at a time
         # costs one storage latency each (16 rows: 1.4 ms on a local SSD, 0.25 ms in parallel; far more on network
         # storage).
-        self.fd = os.open(Path(directory) / info["file"], os.O_RDONLY)
+        files = info["files"] if "files" in info else [info["file"]]
+        self.rows_per_file = info.get("rows_per_file", self.rows)
+        self.fds = [os.open(Path(directory) / f, os.O_RDONLY) for f in files]
         self.pool = ThreadPoolExecutor(read_threads, thread_name_prefix="disk-embedding") if read_threads else None
         self.dtype = dtype
         # Callers read `.weight.device` to place their indices; it follows the model to its device.
@@ -54,7 +56,8 @@ class DiskEmbedding(torch.nn.Module):
     def _read_row(self, row):
         import os
 
-        return os.pread(self.fd, self.row_bytes, row * self.row_bytes)
+        shard, row = divmod(row, self.rows_per_file)
+        return os.pread(self.fds[shard], self.row_bytes, row * self.row_bytes)
 
     def forward(self, ids):
         flat = ids.reshape(-1).tolist()
@@ -81,54 +84,13 @@ def disk_ngram_table(directory):
         _DISK_NGRAM["directory"] = previous
 
 
-def _patch(cls, name, make):
-    """Replace ``cls.name`` by ``make(original)`` once."""
-    original = getattr(cls, name)
-    if getattr(original, "_moe_expert_streaming", False):
-        return
-    patched = make(original)
-    patched._moe_expert_streaming = True
-    setattr(cls, name, patched)
-
-
-def _append(layer, name, current, new, dim):
-    """``torch.cat([current, new], dim)`` as a view of ``layer.<name>``, a buffer grown in steps (copied only then).
-    Starts over from ``current`` when something else replaced it (crop, reorder, offload)."""
-    buffer, view = getattr(layer, name, (None, None))
-    length = current.shape[dim] if current.numel() else 0
-    needed = length + new.shape[dim]
-    if buffer is None or view is not current or buffer.shape[dim] < needed or buffer.device != new.device:
-        capacity = max(needed + 1024, int(needed * 1.25)) // 256 * 256 + 256
-        shape = list(new.shape)
-        shape[dim] = capacity
-        grown = torch.empty(shape, dtype=new.dtype, device=new.device)
-        if length:
-            grown.narrow(dim, 0, length).copy_(current)
-        buffer = grown
-    buffer.narrow(dim, length, new.shape[dim]).copy_(new)
-    view = buffer.narrow(dim, 0, needed)
-    setattr(layer, name, (buffer, view))
-    return view
-
-
 def apply():
     """Install the Qwen3.8 patches and the Metal dense-layer patches (idempotent)."""
-    from transformers.integrations import experts_offload
     from transformers.models.qwen4_exp import modeling_qwen4_exp as m
 
     metal_linear.apply()
 
-    def load_gather_qmm(original):
-        # TODO(portability): replace the dequantize-then-matmul path with a fused CUDA (Triton) gather_qmm.
-        def load(device):
-            return original(device) if torch.device(device).type == "mps" else mlx_affine.gather_qmm
-
-        return load
-
-    if not getattr(experts_offload._load_gather_qmm, "_moe_expert_streaming", False):
-        patched = load_gather_qmm(experts_offload._load_gather_qmm)
-        patched._moe_expert_streaming = True
-        experts_offload._load_gather_qmm = patched
+    patches.patch_gather_qmm()
 
     def ngram_init(original):
         def __init__(self, *args, **kwargs):
@@ -140,56 +102,7 @@ def apply():
 
     _patch(m.Qwen4ExpTextNGramEmbedding, "__init__", ngram_init)
 
-    def gdn_forward(original):
-        # TODO(portability): Metal-only decode step (MPS); other backends keep the original forward.
-        def forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
-            if (
-                hidden_states.device.type == "mps"
-                and hidden_states.shape[1] == 1
-                and gated_delta_net.supports(self, hidden_states, cache_params, attention_mask)
-            ):
-                return gated_delta_net.gated_delta_net_step(self, hidden_states, cache_params)
-            return original(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask, **kwargs)
-
-        return forward
-
-    _patch(m.Qwen4ExpTextGatedDeltaNet, "forward", gdn_forward)
-
-    def gated_norm_forward(original):
-        # TODO(portability): Metal-only (MPS); other backends keep the original forward.
-        def forward(self, hidden_states, gate):
-            if gated_norm.supports(self, hidden_states, gate):
-                return gated_norm.gated_rms_norm(self, hidden_states, gate)
-            return original(self, hidden_states, gate)
-
-        return forward
-
-    _patch(m.Qwen4ExpTextRMSNormGated, "forward", gated_norm_forward)
-    # Prefill (and chunked prompts): the chunked delta rule on ggml's kernel instead of the PyTorch reference.
-    _patch(m, "torch_chunk_gated_delta_rule", lambda original: gdn_prefill.wrap(original, m.l2norm))
-
-    def conv_forward(original):
-        # TODO(portability): Metal-only (MPS); other backends keep the original function.
-        # Token-major output: the q / k / v views the delta rule reads are then rows, not columns.
-        def causal_conv1d_fn(hidden_states, weight, bias=None, activation=None, **kwargs):
-            if (
-                hidden_states.device.type == "mps"
-                and bias is None
-                and activation == "silu"
-                and weight.dim() == 2
-                and weight.shape[-1] == 4
-                and weight.dtype == hidden_states.dtype
-                and hidden_states.dtype in (torch.bfloat16, torch.float16)
-                and not any(v is not None for v in kwargs.values())
-                and not torch.is_grad_enabled()
-                and gdn_prefill.enabled()
-            ):
-                return gdn_scan.conv_silu(hidden_states, weight)
-            return original(hidden_states, weight, bias, activation=activation, **kwargs)
-
-        return causal_conv1d_fn
-
-    _patch(m, "causal_conv1d_fn", conv_forward)
+    patches.patch_gated_delta_net(m, m.Qwen4ExpTextGatedDeltaNet, m.Qwen4ExpTextRMSNormGated)
 
     def residual_forward(original):
         # TODO(portability): Metal-only decode step (MPS); other backends keep the original forward.
@@ -258,7 +171,9 @@ def apply():
                     blocks_only=True,
                 )
                 if selection is not None:
-                    return qsa_decode.attention_forward(self, hidden_states, position_embeddings, past_key_values, *selection)
+                    return qsa_decode.attention_forward(
+                        self, hidden_states, position_embeddings, past_key_values, *selection
+                    )
             return original(self, hidden_states, position_embeddings, attention_mask, past_key_values, **kwargs)
 
         return forward
@@ -269,18 +184,6 @@ def apply():
     # per token at 6K tokens over the 12 layers). Keep them as views of buffers grown in steps; appends write in place.
     from transformers.cache_utils import DynamicIndexedLayer
 
-    def layer_update(original):
-        def update(self, key_states, value_states, *args, **kwargs):
-            if not self.is_initialized:
-                self.lazy_initialization(key_states, value_states)
-            self.keys, self.values = (
-                _append(self, "_key_buffer", self.keys, key_states, -2),
-                _append(self, "_value_buffer", self.values, value_states, -2),
-            )
-            return self.keys, self.values
-
-        return update
-
     def indexer_update(original):
         def update_indexer(self, indexer_key_states):
             if not self.is_indexer_initialized:
@@ -290,7 +193,7 @@ def apply():
 
         return update_indexer
 
-    _patch(DynamicIndexedLayer, "update", layer_update)
+    patches.patch_cache_append(DynamicIndexedLayer)
     _patch(DynamicIndexedLayer, "update_indexer", indexer_update)
 
 

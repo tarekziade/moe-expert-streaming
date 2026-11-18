@@ -195,8 +195,13 @@ def _rows(cache):
         return cache, cache.shape[2] * cache.shape[3]
     base = cache._base
     if (
-        base is not None and base.is_contiguous() and cache.storage_offset() == 0 and base.dim() == 4
-        and cache.stride(3) == 1 and cache.stride(2) == cache.shape[3] and base.stride(1) == cache.stride(1)
+        base is not None
+        and base.is_contiguous()
+        and cache.storage_offset() == 0
+        and base.dim() == 4
+        and cache.stride(3) == 1
+        and cache.stride(2) == cache.shape[3]
+        and base.stride(1) == cache.stride(1)
     ):
         return base, cache.stride(1)
     return cache.contiguous(), cache.shape[2] * cache.shape[3]
@@ -271,8 +276,14 @@ def index_query(qk, weight, cos, sin, heads, eps):
     position; normalized and rotated as the model does, returned in float32 [heads, 128]."""
     out = torch.empty(heads, 128, dtype=torch.float32, device=qk.device)
     getattr(_library(), f"qsa_index_q_{_SUFFIX[qk.dtype]}")(
-        qk, weight, cos.contiguous(), sin.contiguous(), out, _index_params(float(eps), cos.shape[-1], qk.device),
-        threads=heads * 32, group_size=heads * 32,
+        qk,
+        weight,
+        cos.contiguous(),
+        sin.contiguous(),
+        out,
+        _index_params(float(eps), cos.shape[-1], qk.device),
+        threads=heads * 32,
+        group_size=heads * 32,
     )
     return out
 
@@ -283,7 +294,11 @@ def index_scores(query, block_keys):
     scores = torch.empty(blocks, dtype=torch.float32, device=query.device)
     dims = _dims((blocks, heads), query.device)
     getattr(_library(), f"qsa_index_scores_{_SUFFIX[block_keys.dtype]}")(
-        query, block_keys.contiguous(), scores, dims,
-        threads=-(-blocks // SIMDGROUPS) * SIMDGROUPS * 32, group_size=SIMDGROUPS * 32,
+        query,
+        block_keys.contiguous(),
+        scores,
+        dims,
+        threads=-(-blocks // SIMDGROUPS) * SIMDGROUPS * 32,
+        group_size=SIMDGROUPS * 32,
     )
     return scores

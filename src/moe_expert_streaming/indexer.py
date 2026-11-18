@@ -79,7 +79,13 @@ def _rotary():
 
 
 def select(
-    indexer, hidden_states, position_embeddings, attention_mask, past_key_values, apply_rotary_pos_emb, blocks_only=False
+    indexer,
+    hidden_states,
+    position_embeddings,
+    attention_mask,
+    past_key_values,
+    apply_rotary_pos_emb,
+    blocks_only=False,
 ):
     """``indexer.forward`` for a batch of one with a plain causal mask, else ``None`` (before any side effect).
 

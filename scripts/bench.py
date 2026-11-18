@@ -9,6 +9,7 @@ with MTP off on 32 GB Macs. This script runs both on the checkpoint written by `
 Normal use (OS page cache on) unless ``--bypass-page-cache``. Writes one JSON report.
 
 Usage: bench.py CONVERTED_DIR --cache-gib 6 --output report.json [--bits 3] [--runs 1]
+       bench.py QWEN36_DIR --model qwen36 --bits 8 --cache-gib 12 --prefill-chunk-size 1024 --output report.json
 """
 
 import argparse
@@ -22,7 +23,7 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-from moe_expert_streaming import load_qwen38
+from moe_expert_streaming import load_qwen36, load_qwen38
 
 
 STORY = "Write a short story about a lighthouse keeper who finds a message in a bottle."
@@ -162,8 +163,13 @@ def main():
         "--gguf-experts", action="store_true", help="Routed experts from the GGUF's Strata .experts file"
     )
     parser.add_argument("--prefetch-depth", type=int, default=1, help="Layers ahead to guess and read experts")
-    parser.add_argument("--guess-limit", type=int, default=1, help="With --prefetch-depth: best guesses read per layer")
+    parser.add_argument(
+        "--guess-limit", type=int, default=1, help="With --prefetch-depth: best guesses read per layer"
+    )
     parser.add_argument("--preload-profile", type=Path, default=None, help="Routing profile JSON to warm the cache")
+    parser.add_argument(
+        "--model", default="qwen38", choices=("qwen38", "qwen36"), help="qwen36: convert_qwen36.py output"
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     global DEVICE
@@ -172,28 +178,46 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(dense)
     peak = DevicePeak()
     start = time.perf_counter()
-    model = load_qwen38(
-        args.converted,
-        cache_gib=args.cache_gib,
-        bits=args.bits,
-        dense_bits=args.dense_bits if args.dense_bits is not None else "auto",
-        io_threads=args.io_threads,
-        cache_policy=args.cache_policy,
-        bypass_page_cache=args.bypass_page_cache,
-        mps_commit=not args.no_mps_commit,
-        device=DEVICE,
-        host_cache_gib=args.host_cache_gib,
-        host_preload=args.host_preload,
-        gguf_dense=args.gguf_dense,
-        gguf_experts=args.gguf_experts,
-        prefetch_depth=args.prefetch_depth,
-        preload_profile=args.preload_profile,
-        guess_limit=args.guess_limit,
-    )
+    if args.model == "qwen36":
+        model = load_qwen36(
+            args.converted,
+            cache_gib=args.cache_gib,
+            bits=args.bits,
+            dense_bits=args.dense_bits if args.dense_bits is not None else "auto",
+            io_threads=args.io_threads,
+            cache_policy=args.cache_policy,
+            bypass_page_cache=args.bypass_page_cache,
+            mps_commit=not args.no_mps_commit,
+            device=DEVICE,
+            prefetch_depth=args.prefetch_depth,
+            preload_profile=args.preload_profile,
+            guess_limit=args.guess_limit,
+        )
+    else:
+        model = load_qwen38(
+            args.converted,
+            cache_gib=args.cache_gib,
+            bits=args.bits,
+            dense_bits=args.dense_bits if args.dense_bits is not None else "auto",
+            io_threads=args.io_threads,
+            cache_policy=args.cache_policy,
+            bypass_page_cache=args.bypass_page_cache,
+            mps_commit=not args.no_mps_commit,
+            device=DEVICE,
+            host_cache_gib=args.host_cache_gib,
+            host_preload=args.host_preload,
+            gguf_dense=args.gguf_dense,
+            gguf_experts=args.gguf_experts,
+            prefetch_depth=args.prefetch_depth,
+            preload_profile=args.preload_profile,
+            guess_limit=args.guess_limit,
+        )
     load_s = time.perf_counter() - start
     after_load = device_memory()
     report = {
-        "model": "Qwen3.8-Flash-Next (from Qwen/Qwen3.8-Flash-Next-FP8)",
+        "model": "Qwen3.6-35B-A3B (experts from mlx-community/Qwen3.6-35B-A3B-8bit, dense from Qwen/Qwen3.6-35B-A3B)"
+        if args.model == "qwen36"
+        else "Qwen3.8-Flash-Next (from Qwen/Qwen3.8-Flash-Next-FP8)",
         "experts": f"{args.bits}-bit MLX affine, group 64",
         "cache_gib": args.cache_gib,
         "io_threads": args.io_threads,

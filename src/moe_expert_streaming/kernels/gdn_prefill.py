@@ -12,7 +12,7 @@ import os
 
 import torch
 
-from . import gdn_scan
+from ..hub_kernels import gdn_scan
 
 
 @functools.cache

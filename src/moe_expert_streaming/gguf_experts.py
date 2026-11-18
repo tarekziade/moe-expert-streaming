@@ -24,7 +24,7 @@ from pathlib import Path
 import torch
 
 from .gguf_dense import GgufFile, load_kernel
-from .kernels import q2_0
+from .hub_kernels import q2_0
 
 
 # ggml type -> (values per block, bytes per block), expert types.
@@ -241,7 +241,7 @@ def _grouped_forward(module, store, layer, hidden_states, top_k_index, top_k_wei
 def _tiled_forward(module, store, layer, hidden_states, top_k_index, top_k_weights, experts):
     """Prefill on MPS: routes sorted by expert, one tile GEMM per projection over the class pool (dequantizing in the
     kernel, :mod:`.kernels.gguf_mm`); experts that did not fit in the pool go through a temporary bank."""
-    from .kernels import gguf_mm
+    from .hub_kernels import gguf_mm
 
     prefix, top_k = module.offload_prefix, top_k_index.shape[1]
     device = hidden_states.device
@@ -290,7 +290,7 @@ PREFILL_TAIL_ROWS = int(os.environ.get("GGUF_EXPERTS_TAIL_ROWS", "16"))
 def _tiled_forward_v2(module, store, layer, hidden_states, top_k_index, top_k_weights, experts):
     """Prefill on MPS: routes sorted by expert; the tile GEMMs read the hidden states in place through a row index, and
     a combine kernel sums each token's routes (no gathered copy, no scatter)."""
-    from .kernels import gguf_mm
+    from .hub_kernels import gguf_mm
 
     prefix, (tokens, top_k) = module.offload_prefix, top_k_index.shape
     device, tile_rows = hidden_states.device, PREFILL_TILE_ROWS

@@ -36,7 +36,7 @@ def _block_keys(indexer, raw_keys, full_cos, full_sin, first, last, apply_rotary
 
 
 def _fused_ok(indexer, hidden_states):
-    from .kernels import qsa_decode
+    from .hub_kernels import qsa_decode
 
     return (
         hidden_states.device.type == "mps"
@@ -51,7 +51,7 @@ def _fused_ok(indexer, hidden_states):
 def _select_blocks_fused(indexer, hidden_states, position_embeddings, past_key_values, state, kv_length):
     """``select(..., blocks_only=True)`` for a decode step continuing a checked sequence: the query norm + rotary and the
     block scores as two kernels (the original runs ~35 small ops), the same cache update and block keys."""
-    from .kernels import qsa_decode
+    from .hub_kernels import qsa_decode
 
     head_dim, heads, ratio = indexer.index_head_dim, indexer.index_n_heads, indexer.compress_ratio
     full_cos, full_sin = position_embeddings

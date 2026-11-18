@@ -18,7 +18,8 @@ from pathlib import Path
 import torch
 
 from . import indexer, metal_linear, mlx_affine
-from .kernels import gated_delta_net, gated_norm, gdn_prefill, gdn_scan, hyper_connection, qsa_decode
+from .hub_kernels import gated_delta_net, gated_norm, gdn_scan, hyper_connection, qsa_decode
+from .kernels import gdn_prefill
 
 
 class DiskEmbedding(torch.nn.Module):
